@@ -61,7 +61,7 @@ serp_social_bp = Blueprint("serp_social", __name__, template_folder="templates")
 SERPAPI_URL = "https://serpapi.com/search"
 REQUEST_TIMEOUT = 45  # seconds
 DEFAULT_PAGE_LIMIT = 3  # 3 × 100 = up to 300 results per query
-MAX_PAGE_LIMIT = 10     # hard guardrail
+MAX_PAGE_LIMIT = 1000     # hard guardrail
 DEFAULT_THROTTLE_MS = 1000
 
 DEFAULT_COUNTRIES = ["China", "Iran", "Russia"]
@@ -328,9 +328,10 @@ def serpapi_search(api_key: str, query: str, start: int, gparams: dict) -> tuple
         **gparams,
         "q": query,
         "start": str(start),
-        "num": "10",
         "api_key": api_key,
+        "no_cache": "true"
     }
+    print(f"SerpAPI search: q={query} start={start}")
     try:
         r = requests.get(SERPAPI_URL, params=params, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as e:
@@ -437,7 +438,20 @@ def serp_social():
             if not query:
                 out_rows.append({**src})
                 continue
-
+            
+            #save to file every 15 queries
+            if total_queries > 0 and total_queries % 15 == 0:
+                df_partial = pd.DataFrame(out_rows)
+                base_cols = [
+                    "query", "country", "site", "status", "error",
+                    "page_start", "position", "title", "link", "snippet",
+                    "domain", "platform", "is_profile", "profile_type", "profile_handle",
+                    "normalized_profile_url", "fetched_at", "serpapi_search_url",
+                ]
+                df_partial = _standardize_columns(df_partial, base_cols)
+                partial_filename = f"serp_social_partial_{total_queries}_queries.csv"
+                df_partial.to_csv(partial_filename, index=False)
+                print(f"Saved partial results to {partial_filename} {len(out_rows)} rows.")
             any_results = False
             for p in range(page_limit):
                 start = p * 10

@@ -11,4 +11,4 @@ SQLAlchemy==2.0.28
 # vaderSentiment==3.3.2
 # vaderSentiment==3.3.2
 networkx==3.5
-xlsxwriter==3.2.9
+xlsxwriter==3.2.9   

@@ -46,12 +46,12 @@
 
         <div class="col-md-2">
           <label class="form-label">Pages (×10)</label>
-          <input type="number" class="form-control" name="page_limit" min="1" max="10" value="{{ request.form.page_limit or 3 }}">
+          <input type="number" class="form-control" name="page_limit" min="1" max="100" value="{{ request.form.page_limit or 3 }}">
           <div class="form-text">Each page fetches up to 10 results (max 10 pages).</div>
         </div>
         <div class="col-md-3">
           <label class="form-label">Throttle (milliseconds)</label>
-          <input type="number" class="form-control" name="throttle_ms" min="0" step="100" value="{{ request.form.throttle_ms or 1000 }}">
+          <input type="number" class="form-control" name="throttle_ms" min="0" step="10" value="{{ request.form.throttle_ms or 1000 }}">
           <div class="form-text">Delay between page fetches to be polite.</div>
         </div>
 
@@ -134,7 +134,7 @@ Russia, youtube.com
         </div>
         <div class="col-md-2">
           <label class="form-label">Pages (×10)</label>
-          <input type="number" class="form-control" name="page_limit" min="1" max="10" value="{{ request.form.page_limit or 3 }}">
+          <input type="number" class="form-control" name="page_limit" min="1" max="100" value="{{ request.form.page_limit or 3 }}">
         </div>
         <div class="col-md-3">
           <label class="form-label">Throttle (milliseconds)</label>
@@ -206,12 +206,12 @@ Russia, youtube.com
           <input type="password" class="form-control" name="api_key" placeholder="SERPAPI_KEY" value="{{ request.form.api_key or '' }}">
         </div>
         <div class="col-md-2">
-          <label class="form-label">Pages (×100)</label>
-          <input type="number" class="form-control" name="page_limit" min="1" max="10" value="{{ request.form.page_limit or 3 }}">
+          <label class="form-label">Pages (×10)</label>
+          <input type="number" class="form-control" name="page_limit" min="1" max="100" value="{{ request.form.page_limit or 3 }}">
         </div>
         <div class="col-md-3">
           <label class="form-label">Throttle (milliseconds)</label>
-          <input type="number" class="form-control" name="throttle_ms" min="0" step="100" value="{{ request.form.throttle_ms or 1000 }}">
+          <input type="number" class="form-control" name="throttle_ms" min="0" step="10" value="{{ request.form.throttle_ms or 1000 }}">
         </div>
         <div class="col-md-4">
           <label class="form-label">Output</label>
