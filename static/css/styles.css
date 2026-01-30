@@ -82,6 +82,10 @@ body { font-family: "Inter", sans-serif; }
 .bg-tool-orange {
   background: linear-gradient(135deg, #8d2300 0%, #fc7d22 100%);
 }
+.bg-tool-cyan {
+  background: linear-gradient(135deg, #164e63 0%, #22d3ee 100%);
+}
+
 
 /* Accessibility: focus ring for keyboard users on stretched links */
 a.stretched-link:focus-visible {

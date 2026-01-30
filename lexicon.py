@@ -1,12 +1,14 @@
-# lexicon_bp.py (bilingual: English + Spanish)
+# lexicon_bp.py (English only)
 import io
 import re
+import json
+import logging
 import unicodedata
 from collections import Counter
 from urllib.parse import urlparse
 from typing import Optional, Tuple, List, Dict
 
-from flask import Blueprint, request, render_template, redirect, url_for, flash, send_file
+from flask import Blueprint, request, render_template, redirect, url_for, flash, send_file, current_app
 import pandas as pd
 import numpy as np
 import nltk
@@ -16,6 +18,7 @@ from nltk.tokenize import word_tokenize
 
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import spacy
+import spacy.cli
 from io import BytesIO
 from datetime import datetime  # fixed import
 
@@ -56,7 +59,16 @@ def extract_key_phrases(doc, top_n=5):
     
 
 
+# --- Logging helper ---
+_MODULE_LOGGER = logging.getLogger(__name__)
 
+def _log_progress(msg: str):
+    """Send progress info to the Flask app logger if present; fallback to module logger."""
+    try:
+        logger = current_app.logger  # type: ignore[attr-defined]
+    except Exception:
+        logger = _MODULE_LOGGER
+    logger.info(msg)
 
 # NEW: truthy parser for request flags
 def _truthy(v) -> bool:
@@ -73,42 +85,26 @@ nltk.download("punkt", quiet=True)
 # --- English sentiment (VADER) ---
 SIA_EN = SentimentIntensityAnalyzer()
 
-# --- Try loading spaCy models; fall back to blank pipelines if absent ---
-def _load_spacy(lang: str):
+# --- Try loading spaCy model; fall back to blank pipeline if absent ---
+def _load_spacy_en():
     try:
-        if lang == "es":
-            return spacy.load("es_core_news_sm")
         return spacy.load("en_core_web_sm")
     except Exception:
-        # Fallback: blank pipeline (no NER), keeps everything else working
-        return spacy.blank("es" if lang == "es" else "en")
+        # Best-effort auto-download; if it still fails, propagate to surface the error
+        spacy.cli.download("en_core_web_sm", quiet=True)
+        return spacy.load("en_core_web_sm")
 
 # Pre-load cache; load lazily depending on flags
-NLP_CACHE = {"en_full": None, "es_full": None, "en_blank": None, "es_blank": None}
+NLP_CACHE = {"en_full": None, "en_blank": None}
 
-def _get_nlp(lang: str, use_ner: bool = True):
-    code = "es" if lang == "es" else "en"
-    key = f"{code}_{'full' if use_ner else 'blank'}"
+def _get_nlp(use_ner: bool = True):
+    key = "en_full" if use_ner else "en_blank"
     if NLP_CACHE[key] is None:
-        NLP_CACHE[key] = _load_spacy(code) if use_ner else spacy.blank(code)
+        NLP_CACHE[key] = _load_spacy_en() if use_ner else spacy.blank("en")
     return NLP_CACHE[key]
 
-# --- Stopword sets ---
+# --- Stopword set ---
 STOP_EN = set(stopwords.words("english"))
-STOP_ES = set(stopwords.words("spanish"))
-
-# --- Spanish negative lexicon (compact, extensible) ---
-# Stored accent-free for robust matching; we strip accents from text before scoring.
-SPANISH_NEG_LEXICON = {
-    # general polarity
-    "malo", "terrible", "horrible", "pesimo", "pésimo", "nefasto", "negativo",
-    "odio", "odiar", "toxico", "tóxico", "desastre", "caos", "crisis", "peligro",
-    "amenaza", "riesgo", "fracaso", "estafa", "fraude", "corrupcion", "corrupción",
-    "mentira", "enganio", "engaño", "falso", "violencia", "ataque", "boicot",
-    "ilegal", "criminal", "escandalo", "escándalo", "panico", "pánico",
-    # discourse / online harms
-    "acoso", "hostigamiento", "insulto", "odio", "difamacion", "difamación",
-}
 
 def _strip_accents(s: str) -> str:
     return "".join(
@@ -116,12 +112,8 @@ def _strip_accents(s: str) -> str:
         if not unicodedata.combining(c)
     )
 
-def _parse_language() -> str:
-    lang = (request.form.get("lang") or "en").strip().lower()
-    return "es" if lang.startswith("es") else "en"
-
-def _get_stopwords(lang: str):
-    return STOP_ES if lang == "es" else STOP_EN
+def _get_stopwords():
+    return STOP_EN
 
 def _split_terms(q: str) -> List[str]:
     """Split a query string on commas or newlines; trim blanks."""
@@ -181,8 +173,8 @@ def clean_text(text: str) -> str:
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"@\w+", "", text)
     text = re.sub(r"#", "", text)
-    # Remove non-alphanumeric characters (preserve Spanish letters, digits, and basic punctuation)
-    text = re.sub(r'[^a-zA-ZÀ-ÿ0-9\s.!?,;:\-\(\)]', ' ', text)
+    # Remove non-alphanumeric characters (keep digits and basic punctuation)
+    text = re.sub(r'[^a-zA-Z0-9\s.!?,;:\-\(\)]', ' ', text)
     # Remove extra spaces
     text = re.sub(r'\s+', ' ', text).strip()
     return text.strip()
@@ -238,19 +230,19 @@ def extract_tweet_details(article_clean_top_node):
     return tweets_data
 
 
-def tokenize(text: str, lang: str) -> List[str]:
+def tokenize(text: str, lang: str = "en") -> List[str]:
     """
     Language-aware tokenization:
     - Lowercase
     - NLTK word_tokenize fallback to regex on error
     - Remove stopwords, keep alphabetic tokens
     """
-    sw = _get_stopwords(lang)
+    sw = _get_stopwords()
     txt = text.lower()
     try:
-        toks = word_tokenize(txt, language="spanish" if lang == "es" else "english")
+        toks = word_tokenize(txt, language="english")
     except Exception:
-        toks = re.findall(r"[a-záéíóúüñ]+", txt)
+        toks = re.findall(r"[a-z]+", txt)
     return [t for t in toks if t.isalpha() and t not in sw]
 
 def get_ngrams(tokens, n):
@@ -306,44 +298,31 @@ def differential_dataframe(group_freqs, group_a, group_b, top_n=50):
     df_diff = pd.DataFrame(records).sort_values("differential_norm", ascending=False)
     return df_diff
 
-# --- Sentiment (language-aware) ---
+# --- Sentiment (English only) ---
 
-def _neg_intensity_en(text: str) -> float:
-    return float(SIA_EN.polarity_scores(text)["neg"])
+def _sentiment_score_en(text: str) -> float:
+    return float(SIA_EN.polarity_scores(text)["compound"])
 
-def _neg_intensity_es(text: str) -> float:
-    """
-    Very lightweight Spanish negative-intensity proxy:
-    Count negative-lexicon tokens per total tokens (accent-insensitive).
-    """
-    txt = _strip_accents(text.lower())
-    toks = re.findall(r"[a-zñ]+", txt)
-    if not toks:
-        return 0.0
-    neg_hits = sum(1 for t in toks if t in { _strip_accents(w) for w in SPANISH_NEG_LEXICON })
-    return float(neg_hits) / float(len(toks))
 
-def sentiment_summary(df: pd.DataFrame, text_col: str, group_col: str, lang: str) -> pd.DataFrame:
-    if lang == "es":
-        df["negIntensity"] = df[text_col].apply(_neg_intensity_es)
-    else:
-        df["negIntensity"] = df[text_col].apply(_neg_intensity_en)
+def sentiment_summary(df: pd.DataFrame, text_col: str, group_col: str) -> pd.DataFrame:
+    # Use a unified sentiment score column (VADER compound for English)
+    df["score"] = df[text_col].apply(_sentiment_score_en)
 
     records = []
     for group, sub in df.groupby(group_col):
-        neg_nonzero = sub["negIntensity"][sub["negIntensity"] > 0]
-        n = len(neg_nonzero)
+        scores = sub["score"].dropna()
+        n = len(scores)
         if n == 0:
             continue
-        mean = neg_nonzero.mean()
-        std = neg_nonzero.std(ddof=1)
+        mean = scores.mean()
+        std = scores.std(ddof=1)
         se = std / np.sqrt(n) if n > 0 else np.nan
         z = 1.96
         records.append(
             {
                 "group": group,
-                "count_nonzero": int(n),
-                "mean_neg_intensity": float(mean),
+                "count": int(n),
+                "mean_score": float(mean),
                 "std_dev": float(std),
                 "std_error": float(se),
                 "95ci_lower": float(mean - z * se),
@@ -415,14 +394,16 @@ def _load_dataframe_from_upload(file_storage, sheet_name: Optional[str] = None) 
 def upload_and_process():
     results: Dict = {}
     columns: List[str] = []
-    lang = _parse_language()  # default 'en' on GET or missing
+    lang = "en"
+    _log_progress("lexicon: request start lang=en")
 
     # Defaults so we can include them in META even on GET
     filter_query = (request.form.get("filter_query") or "").strip()
     filter_logic = (request.form.get("filter_logic") or "any").lower()   # "any" or "all"
     filter_regex = bool(request.form.get("filter_regex"))
-
+    
     if request.method == "POST":
+        print("lexicon: file upload received")
         uploaded = request.files.get("csv_file")
         if not uploaded or not uploaded.filename:
             flash("No file uploaded", "warning")
@@ -431,6 +412,7 @@ def upload_and_process():
         try:
             excel_sheet = (request.form.get("excel_sheet") or "").strip() or None
             df = _load_dataframe_from_upload(uploaded, sheet_name=excel_sheet)
+            _log_progress(f"lexicon: file loaded rows={len(df)} cols={len(df.columns)}")
         except Exception as e:
             flash(f"Failed to read file: {e}", "danger")
             return redirect(url_for("lexicon.upload_and_process"))
@@ -438,14 +420,22 @@ def upload_and_process():
         columns = df.columns.tolist()
         text_col = request.form.get("text_column")
         group_col = request.form.get("group_column") or None
+        enrich_only = _truthy(request.form.get("enrich_only"))
+        fmt = (request.form.get("format") or "").strip().lower()
 
         # NEW: toggles for optional NLP work
         enable_tokens = _truthy(request.form.get("enable_tokens", "true"))
         enable_entities = _truthy(request.form.get("enable_entities", "true"))
-        enable_sentiment = _truthy(request.form.get("enable_sentiment", "true"))
+        enable_sentiment = _truthy(request.form.get("enable_sentiment", "false"))
         # NEW: toggle for key phrase extraction
-        enable_key_phrases = _truthy(request.form.get("enable_key_phrases", "true"))
-
+        enable_key_phrases = _truthy(request.form.get("enable_key_phrases", "false"))
+        print("lexicon: processing options -", {
+            "enrich_only": enrich_only,
+            "enable_tokens": enable_tokens,
+            "enable_entities": enable_entities,
+            "enable_sentiment": enable_sentiment,
+            "enable_key_phrases": enable_key_phrases,
+        })
         # Check KeyBERT availability
         if enable_key_phrases and not KEYBERT_AVAILABLE:
             flash("KeyBERT is not available. Install 'keybert' and 'sentence-transformers' to enable key phrase extraction.", "warning")
@@ -479,6 +469,7 @@ def upload_and_process():
             kept = int(mask.sum())
             total = int(len(mask))
             df = df[mask].copy()
+            print(f"lexicon: filter applied kept={kept}/{total}")
             results["filter_info"] = {
                 "query": filter_query,
                 "logic": filter_logic,
@@ -493,19 +484,23 @@ def upload_and_process():
 
         # --- Clean + extract ---
         df["clean_text"] = df[text_col].apply(clean_text)
+        print("lexicon: clean text done")
 
         # Tokens (optional)
         if enable_tokens:
             df["tokens"] = df["clean_text"].apply(lambda t: tokenize(t, lang))
+            print("lexicon: tokens generated")
         else:
             df["tokens"] = [[] for _ in range(len(df))]
 
         # Entities (optional, lazy spaCy)
         if enable_entities:
-            nlp = _get_nlp(lang, use_ner=True)
-            df["entities"] = df["clean_text"].apply(
-                lambda t: [ent.text for ent in nlp(t).ents] if nlp.has_pipe("ner") else []
-            )
+            nlp = _get_nlp(use_ner=True)
+            if not nlp.has_pipe("ner"):
+                flash("spaCy NER model unavailable. Install 'en_core_web_sm' to enable entity extraction.", "danger")
+                return redirect(url_for("lexicon.upload_and_process"))
+            df["entities"] = df[text_col].apply(lambda t: [ent.text for ent in nlp(t).ents])
+            print("lexicon: entities extracted via spaCy NER")
         else:
             df["entities"] = [[] for _ in range(len(df))]
 
@@ -514,6 +509,7 @@ def upload_and_process():
             df["key_phrases_raw"] = df["clean_text"].apply(lambda t: extract_key_phrases(t, top_n=5))
             df["key_phrases"] = df["key_phrases_raw"].apply(lambda kw_list: [phrase for phrase, score in kw_list])
             df["key_phrase_scores"] = df["key_phrases_raw"].apply(lambda kw_list: [f"{phrase}:{score:.3f}" for phrase, score in kw_list])
+            print("lexicon: key phrases extracted")
         else:
             df["key_phrases"] = [[] for _ in range(len(df))]
             df["key_phrase_scores"] = [[] for _ in range(len(df))]
@@ -524,6 +520,7 @@ def upload_and_process():
         df["hashtags"] = meta.apply(lambda x: x[1])
         df["links"] = meta.apply(lambda x: x[2])
         df["domains"] = meta.apply(lambda x: x[3])
+        print("lexicon: meta (mentions/hashtags/links/domains) extracted")
 
         # NEW: HTML parsing with XPath (embedded links + tweets)
         if html_col:
@@ -543,6 +540,7 @@ def upload_and_process():
             )
             # Clean up heavy roots to keep memory down
             del df["__html_root"]
+            print("lexicon: HTML parsing complete")
 
         # Grouping
         if group_col and group_col in df.columns:
@@ -553,11 +551,12 @@ def upload_and_process():
             groups = ["all"]
 
         # Frequencies (optional; only when tokens are enabled)
-        if enable_tokens:
+        if enable_tokens and not enrich_only:
             group_freqs = {}
             for g in groups:
                 token_lists = df[df[group_col] == g]["tokens"].tolist()
                 group_freqs[g] = build_frequency_series(token_lists, include_ngrams=(1, 2, 3))
+            print("lexicon: frequency tables built")
 
             # Summaries per group
             summary_per_group = {}
@@ -580,149 +579,195 @@ def upload_and_process():
 
         # Sentiment (optional, language-aware)
         if enable_sentiment:
-            sentiment_df = sentiment_summary(df, "clean_text", group_col, lang)
-            results["sentiment_summary"] = sentiment_df.to_dict(orient="records")
+            sentiment_df = sentiment_summary(df, "clean_text", group_col)
+            print("lexicon: sentiment computed")
+            results["sentiment_summary"] = [] if enrich_only else sentiment_df.to_dict(orient="records")
         else:
             results["sentiment_summary"] = []
 
         # Meta counts
         meta_summary = {}
-        for g in groups:
-            subset = df[df[group_col] == g]
-            meta_summary[g] = {
-                "mentions": cum_counts(subset["mentions"]).to_dict(),
-                "hashtags": cum_counts(subset["hashtags"]).to_dict(),
-                "links": cum_counts(subset["links"]).to_dict(),
-                "domains": cum_counts(subset["domains"]).to_dict(),
-                "entities": cum_counts(subset["entities"]).to_dict(),
-                "key_phrases": cum_counts(subset["key_phrases"]).to_dict(),
-            }
-            # NEW: add HTML-derived meta if present
-            if "embedded_links_xpath" in df.columns:
-                meta_summary[g]["embedded_links_xpath"] = cum_counts(subset["embedded_links_xpath"]).to_dict()
-            if "tweet_ids" in df.columns:
-                meta_summary[g]["tweet_ids"] = cum_counts(subset["tweet_ids"]).to_dict()
-            if "tweet_screen_names" in df.columns:
-                meta_summary[g]["tweet_screen_names"] = cum_counts(subset["tweet_screen_names"]).to_dict()
+        if not enrich_only:
+            for g in groups:
+                subset = df[df[group_col] == g]
+                meta_summary[g] = {
+                    "mentions": cum_counts(subset["mentions"]).to_dict(),
+                    "hashtags": cum_counts(subset["hashtags"]).to_dict(),
+                    "links": cum_counts(subset["links"]).to_dict(),
+                    "domains": cum_counts(subset["domains"]).to_dict(),
+                    "entities": cum_counts(subset["entities"]).to_dict(),
+                    "key_phrases": cum_counts(subset["key_phrases"]).to_dict(),
+                }
+                # NEW: add HTML-derived meta if present
+                if "embedded_links_xpath" in df.columns:
+                    meta_summary[g]["embedded_links_xpath"] = cum_counts(subset["embedded_links_xpath"]).to_dict()
+                if "tweet_ids" in df.columns:
+                    meta_summary[g]["tweet_ids"] = cum_counts(subset["tweet_ids"]).to_dict()
+                if "tweet_screen_names" in df.columns:
+                    meta_summary[g]["tweet_screen_names"] = cum_counts(subset["tweet_screen_names"]).to_dict()
+            _log_progress("lexicon: meta summary built")
         results["meta"] = meta_summary
 
-    # Excel export (unified group handling + filter META)
-    if request.form.get("format") == "excel":
-        sheets: Dict[str, pd.DataFrame] = {}
+        # ---------- Export handling (Excel / CSV) ----------
+        if request.method == "POST" and fmt in {"excel", "csv"}:
+            # Always build an enriched dataframe for export
+            def _serialize_cell(val):
+                if isinstance(val, (list, tuple)):
+                    return "; ".join([json.dumps(v) if isinstance(v, dict) else str(v) for v in val])
+                return val
 
-        # === Raw & normalized top terms (single tables with 'group' col) ===
-        raw_rows, norm_rows = [], []
-        for group, summary in results.get("group_freqs", {}).items():
-            for term, count in summary.get("top_raw", {}).items():
-                raw_rows.append({"group": group, "term": term, "count_raw": count})
-            for term, val in summary.get("top_normalized", {}).items():
-                norm_rows.append({"group": group, "term": term, "normalized_per_thousand": val})
+            export_df = df.copy()
+            if "clean_text" in export_df.columns:
+                export_df = export_df.drop(columns=["clean_text"])
+            list_like_cols = [
+                "tokens",
+                "entities",
+                "key_phrases",
+                "key_phrase_scores",
+                "mentions",
+                "hashtags",
+                "links",
+                "domains",
+                "embedded_links_xpath",
+                "embedded_tweets",
+                "tweet_ids",
+                "tweet_screen_names",
+            ]
+            for col in list_like_cols:
+                if col in export_df.columns:
+                    export_df[col] = export_df[col].apply(_serialize_cell)
 
-        if raw_rows:
-            sheets["TOP_RAW"] = (
-                pd.DataFrame(raw_rows)
-                .sort_values(["group", "count_raw"], ascending=[True, False])
-                .reset_index(drop=True)
-            )
-        if norm_rows:
-            sheets["TOP_NORMALIZED"] = (
-                pd.DataFrame(norm_rows)
-                .sort_values(["group", "normalized_per_thousand"], ascending=[True, False])
-                .reset_index(drop=True)
-            )
+            if fmt == "csv":
+                _log_progress("lexicon: exporting enriched CSV")
+                output = BytesIO()
+                export_df.to_csv(output, index=False)
+                output.seek(0)
+                filename = "lexical_enriched_en_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".csv"
+                return send_file(output, mimetype="text/csv", as_attachment=True, download_name=filename)
 
-        # === Group totals ===
-        totals_rows = []
-        for group, summary in results.get("group_freqs", {}).items():
-            totals_rows.append({
-                "group": group,
-                "total_token_equivalents": summary.get("total_token_equivalents", 0)
-            })
-        if totals_rows:
-            sheets["GROUP_TOTALS"] = pd.DataFrame(totals_rows).sort_values("group").reset_index(drop=True)
+            # Excel export path (single or multi-sheet)
+            _log_progress("lexicon: exporting Excel")
+            sheets: Dict[str, pd.DataFrame] = {}
+            sheets["ENRICHED"] = export_df
 
-        # === Meta counts (mentions, hashtags, links, domains, entities, + HTML) ===
-        meta_keys = ["mentions", "hashtags", "links", "domains", "entities", "key_phrases"]
-        # Add optional HTML-derived keys if present
-        any_meta = results.get("meta") or {}
-        if any(k in (any_meta.get(g, {}) or {}) for g in any_meta for k in ["embedded_links_xpath"]):
-            meta_keys.append("embedded_links_xpath")
-        if any(k in (any_meta.get(g, {}) or {}) for g in any_meta for k in ["tweet_ids"]):
-            meta_keys.append("tweet_ids")
-        if any(k in (any_meta.get(g, {}) or {}) for g in any_meta for k in ["tweet_screen_names"]):
-            meta_keys.append("tweet_screen_names")
+            if not enrich_only:
+                # === Raw & normalized top terms (single tables with 'group' col) ===
+                raw_rows, norm_rows = [], []
+                for group, summary in results.get("group_freqs", {}).items():
+                    for term, count in summary.get("top_raw", {}).items():
+                        raw_rows.append({"group": group, "term": term, "count_raw": count})
+                    for term, val in summary.get("top_normalized", {}).items():
+                        norm_rows.append({"group": group, "term": term, "normalized_per_thousand": val})
 
+                if raw_rows:
+                    sheets["TOP_RAW"] = (
+                        pd.DataFrame(raw_rows)
+                        .sort_values(["group", "count_raw"], ascending=[True, False])
+                        .reset_index(drop=True)
+                    )
+                if norm_rows:
+                    sheets["TOP_NORMALIZED"] = (
+                        pd.DataFrame(norm_rows)
+                        .sort_values(["group", "normalized_per_thousand"], ascending=[True, False])
+                        .reset_index(drop=True)
+                    )
 
-        for meta_key in meta_keys:
-            meta_rows = []
-            for group, metas in results.get("meta", {}).items():
-                for val, count in (metas or {}).get(meta_key, {}).items():
-                    meta_rows.append({"group": group, meta_key[:-1] if meta_key.endswith("s") else meta_key: val, "count": count})
-            if meta_rows:
-                sheets[meta_key.upper()] = (
-                    pd.DataFrame(meta_rows)
-                    .sort_values(["group", "count"], ascending=[True, False])
-                    .reset_index(drop=True)
-                )
-
-        # === Differential (own sheet) ===
-        if "differential" in results and results.get("differential_groups"):
-            sheets["DIFFERENTIAL"] = pd.DataFrame(results["differential"])
-
-        # === Sentiment (own sheet) ===
-        if results.get("sentiment_summary"):
-            sheets["SENTIMENT_SUMMARY"] = pd.DataFrame(results["sentiment_summary"])
-
-        # NEW: Detailed embedded tweets sheet (flattened)
-        if "embedded_tweets" in df.columns:
-            tweet_rows = []
-            for _, row in df.iterrows():
-                grp = row[group_col]
-                for t in row["embedded_tweets"]:
-                    if not isinstance(t, dict):
-                        continue
-                    tweet_rows.append({
-                        "group": grp,
-                        "tweetId": t.get("tweetId"),
-                        "screenName": t.get("screenName"),
-                        "tweetLink": t.get("tweetLink"),
-                        "tweetText": t.get("tweetText"),
+                # === Group totals ===
+                totals_rows = []
+                for group, summary in results.get("group_freqs", {}).items():
+                    totals_rows.append({
+                        "group": group,
+                        "total_token_equivalents": summary.get("total_token_equivalents", 0)
                     })
-            if tweet_rows:
-                sheets["EMBEDDED_TWEETS"] = pd.DataFrame(tweet_rows).sort_values(["group", "screenName"]).reset_index(drop=True)
+                if totals_rows:
+                    sheets["GROUP_TOTALS"] = pd.DataFrame(totals_rows).sort_values("group").reset_index(drop=True)
 
-        # === META (record filter + language + html column + flags) ===
-        fi = results.get("filter_info", {})
-        sheets["META"] = pd.DataFrame([{
-            "language": lang,
-            "filter_query": fi.get("query", ""),
-            "filter_logic": fi.get("logic", ""),
-            "filter_regex": fi.get("regex", False),
-            "filtered_rows_kept": fi.get("kept", None),
-            "filtered_rows_total": fi.get("total", None),
-            "html_column": (request.form.get("html_column") or "").strip(),
-            "enable_tokens": _truthy(request.form.get("enable_tokens", "true")),
-            "enable_entities": _truthy(request.form.get("enable_entities", "true")),
-            "enable_sentiment": _truthy(request.form.get("enable_sentiment", "true")),
-            # NEW: record key phrase flag
-            "enable_key_phrases": _truthy(request.form.get("enable_key_phrases", "true")),
-            "keybert_available": KEYBERT_AVAILABLE,
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }])
+                # === Meta counts (mentions, hashtags, links, domains, entities, + HTML) ===
+                meta_keys = ["mentions", "hashtags", "links", "domains", "entities", "key_phrases"]
+                any_meta = results.get("meta") or {}
+                if any(k in (any_meta.get(g, {}) or {}) for g in any_meta for k in ["embedded_links_xpath"]):
+                    meta_keys.append("embedded_links_xpath")
+                if any(k in (any_meta.get(g, {}) or {}) for g in any_meta for k in ["tweet_ids"]):
+                    meta_keys.append("tweet_ids")
+                if any(k in (any_meta.get(g, {}) or {}) for g in any_meta for k in ["tweet_screen_names"]):
+                    meta_keys.append("tweet_screen_names")
 
-        filename = f"lexical_sentiment_analysis_{lang}_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".xlsx"
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            for sheet_name, data in sheets.items():
-                safe = sheet_name[:31].replace("/", "_").replace("\\", "_")
-                data.to_excel(writer, sheet_name=safe, index=False)
-        output.seek(0)
-        return send_file(
-            output,
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            as_attachment=True,
-            download_name=filename,
-        )
+                for meta_key in meta_keys:
+                    meta_rows = []
+                    for group, metas in results.get("meta", {}).items():
+                        for val, count in (metas or {}).get(meta_key, {}).items():
+                            meta_rows.append({"group": group, meta_key[:-1] if meta_key.endswith("s") else meta_key: val, "count": count})
+                    if meta_rows:
+                        sheets[meta_key.upper()] = (
+                            pd.DataFrame(meta_rows)
+                            .sort_values(["group", "count"], ascending=[True, False])
+                            .reset_index(drop=True)
+                        )
+
+                # === Differential (own sheet) ===
+                if "differential" in results and results.get("differential_groups"):
+                    sheets["DIFFERENTIAL"] = pd.DataFrame(results["differential"])
+
+                # === Sentiment (own sheet) ===
+                if results.get("sentiment_summary"):
+                    sheets["SENTIMENT_SUMMARY"] = pd.DataFrame(results["sentiment_summary"])
+
+                # === Detailed embedded tweets sheet (flattened)
+                if "embedded_tweets" in df.columns:
+                    tweet_rows = []
+                    for _, row in df.iterrows():
+                        grp = row[group_col]
+                        for t in row["embedded_tweets"]:
+                            if not isinstance(t, dict):
+                                continue
+                            tweet_rows.append({
+                                "group": grp,
+                                "tweetId": t.get("tweetId"),
+                                "screenName": t.get("screenName"),
+                                "tweetLink": t.get("tweetLink"),
+                                "tweetText": t.get("tweetText"),
+                            })
+                    if tweet_rows:
+                        sheets["EMBEDDED_TWEETS"] = pd.DataFrame(tweet_rows).sort_values(["group", "screenName"]).reset_index(drop=True)
+
+            # === META (record filter + language + html column + flags) ===
+            fi = results.get("filter_info", {})
+            sheets["META"] = pd.DataFrame([{
+                "language": "en",
+                "filter_query": fi.get("query", ""),
+                "filter_logic": fi.get("logic", ""),
+                "filter_regex": fi.get("regex", False),
+                "filtered_rows_kept": fi.get("kept", None),
+                "filtered_rows_total": fi.get("total", None),
+                "html_column": (request.form.get("html_column") or "").strip(),
+                "enable_tokens": _truthy(request.form.get("enable_tokens", "false")),
+                "enable_entities": _truthy(request.form.get("enable_entities", "false")),
+                "enable_sentiment": _truthy(request.form.get("enable_sentiment", "false")),
+                # NEW: record key phrase flag
+                "enable_key_phrases": _truthy(request.form.get("enable_key_phrases", "false")),
+                "enrich_only": enrich_only,
+                "keybert_available": KEYBERT_AVAILABLE,
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }])
+
+            filename = ("lexical_enriched_" if enrich_only else "lexical_sentiment_analysis_")
+            filename += "en_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".xlsx"
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                for sheet_name, data in sheets.items():
+                    safe = sheet_name[:31].replace("/", "_").replace("\\", "_")
+                    data.to_excel(writer, sheet_name=safe, index=False)
+            output.seek(0)
+              # SAve file locally for debugging
+            with open("debug_output.xlsx", "wb") as f:
+                f.write(output.getbuffer())
+            
+            return send_file(
+                output,
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                as_attachment=True,
+                download_name=filename,
+            )
 
     return render_template(
         "lexicon.html",

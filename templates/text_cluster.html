@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row mb-4">
+  <div class="col-lg-8">
+    <h1 class="h3 mb-2">Text Similarity Clustering</h1>
+    <p class="text-muted">Paste short texts or upload a CSV/TXT file to group semantically similar items using SBERT embeddings. Clusters are built greedily using a cosine similarity threshold.</p>
+  </div>
+</div>
+
+<form method="post" enctype="multipart/form-data" class="mb-4">
+  <div class="mb-3">
+    <label class="form-label">Paste texts (one per line)</label>
+    <textarea class="form-control" name="texts" rows="8" placeholder="One text per line">{{ request.form.get("texts", "") }}</textarea>
+  </div>
+  <div class="mb-3">
+    <label class="form-label">Or upload CSV/TXT</label>
+    <input class="form-control" type="file" name="text_file" accept=".csv,.txt">
+    <div class="form-text">CSV: uses the <code>text</code> column if present, otherwise the first column. Processes up to {{ max_docs }} rows.</div>
+  </div>
+  <div class="row g-3 align-items-end">
+    <div class="col-sm-4">
+      <label class="form-label">Similarity threshold</label>
+      <input class="form-control" type="number" name="threshold" step="0.05" min="0.3" max="0.95" value="{{ '%.2f'|format(threshold) }}">
+      <div class="form-text">Higher = stricter clusters (default 0.60).</div>
+    </div>
+    <div class="col-sm-4">
+      <button class="btn btn-primary" type="submit">Cluster texts</button>
+    </div>
+  </div>
+</form>
+
+{% if clusters %}
+  <div class="mb-3">
+    <div class="d-flex justify-content-between">
+      <div><strong>{{ clusters|length }}</strong> clusters from <strong>{{ total }}</strong> texts.</div>
+      <div class="text-muted">Sorted by size; similarity shown vs the cluster seed.</div>
+    </div>
+  </div>
+  {% for cluster in clusters %}
+    <div class="card mb-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <div>Cluster {{ cluster.id }}</div>
+        <span class="badge bg-secondary">{{ cluster.size }} item{{ 's' if cluster.size != 1 else '' }}</span>
+      </div>
+      <ul class="list-group list-group-flush">
+        {% for item in cluster.members %}
+          <li class="list-group-item">
+            <div class="d-flex justify-content-between">
+              <div>{{ item.text }}</div>
+              <small class="text-muted">{{ "%.2f"|format(item.similarity) }}</small>
+            </div>
+          </li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endfor %}
+{% elif request.method == "POST" %}
+  <div class="alert alert-warning">No texts were provided.</div>
+{% endif %}
+{% endblock %}

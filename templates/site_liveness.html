@@ -1,0 +1,223 @@
+{# File: templates/site_liveness.html #}
+{% extends 'base.html' %}
+{% block content %}
+{% set results = results|default({}) %}
+
+<h2 classi="mb-3">Site Liveness Checker (CSV)</h2>
+<p>
+  Upload a CSV, choose one or more site columns, and I will check whether each site is reachable.
+  All original columns are preserved, and new columns (for example, <code>is_live</code>, <code>http_status</code>, <code>response_time_ms</code>, <code>resolved_ips</code>) are appended.
+</p>
+
+{% if results.error %}
+  <div class="alert alert-danger" role="alert">
+    {{ results.error }}
+  </div>
+{% endif %}
+
+<div class="card mb-3">
+  <div class="card-body">
+    <form method="post" enctype="multipart/form-data" class="row g-3">
+      <input type="hidden" name="mode" value="file">
+
+      <div class="col-12">
+        <label class="form-label">Upload CSV</label>
+        <input type="file" class="form-control" name="file" accept=".csv,text/csv" required>
+        <div class="form-text">
+          The app preserves all columns. By default it looks for a <code>site</code> column, but you can specify others below.
+        </div>
+      </div>
+
+      <div class="col-md-6">
+        <label class="form-label">Site Columns (comma-separated)</label>
+        <input type="text" class="form-control" name="site_columns" placeholder="site" value="{{ request.form.site_columns or 'site' }}">
+        <div class="form-text">
+          Example: <code>site, domain, host, url</code>. Full URLs or bare hostnames work.
+        </div>
+      </div>
+
+      <div class="col-md-6">
+        <label class="form-label">Path (optional)</label>
+        <input type="text" class="form-control" name="path" placeholder="/" value="{{ request.form.path or '/' }}">
+        <div class="form-text">
+          If the input is only a hostname, the checker will request this path. If the input includes a path already, that path is used.
+        </div>
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">HTTP Method</label>
+        {% set method = (request.form.method or 'head')|lower %}
+        <select class="form-select" name="method">
+          <option value="head" {% if method == 'head' %}selected{% endif %}>HEAD (faster, minimal data)</option>
+          <option value="get" {% if method == 'get' %}selected{% endif %}>GET (more compatible)</option>
+        </select>
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">Follow Redirects</label>
+        {% set fr = request.form.follow_redirects %}
+        <select class="form-select" name="follow_redirects">
+          <option value="1" {% if fr != '0' %}selected{% endif %}>Yes</option>
+          <option value="0" {% if fr == '0' %}selected{% endif %}>No</option>
+        </select>
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">Prefer HTTPS</label>
+        {% set ph = request.form.prefer_https %}
+        <select class="form-select" name="prefer_https">
+          <option value="1" {% if ph != '0' %}selected{% endif %}>Yes (try HTTPS, then HTTP)</option>
+          <option value="0" {% if ph == '0' %}selected{% endif %}>No (try HTTP, then HTTPS)</option>
+        </select>
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">Require 200–399</label>
+        {% set rho = request.form.require_http_ok %}
+        <select class="form-select" name="require_http_ok">
+          <option value="0" {% if rho != '1' %}selected{% endif %}>No (any HTTP response counts as live)</option>
+          <option value="1" {% if rho == '1' %}selected{% endif %}>Yes (must be 200–399)</option>
+        </select>
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">Max Redirects</label>
+        <input type="number" class="form-control" name="max_redirects" min="1" max="20" value="{{ request.form.max_redirects or 10 }}">
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">HTTP Timeout (seconds)</label>
+        <input type="number" class="form-control" name="timeout" min="1" max="60" step="1" value="{{ request.form.timeout or 10 }}">
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">TCP Timeout (seconds)</label>
+        <input type="number" class="form-control" name="tcp_timeout" min="1" max="30" step="1" value="{{ request.form.tcp_timeout or 3 }}">
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label">Output</label>
+        <div class="d-flex gap-3 pt-2 flex-wrap">
+          {% set om = request.form.output_mode %}
+          <div class="form-check">
+            <input class="form-check-input" type="radio" name="output_mode" id="table0" value="table" {% if om != 'excel' and om != 'csv' %}checked{% endif %}>
+            <label class="form-check-label" for="table0">Table (on-page)</label>
+          </div>
+          <div class="form-check">
+            <input class="form-check-input" type="radio" name="output_mode" id="excel0" value="excel" {% if om == 'excel' %}checked{% endif %}>
+            <label class="form-check-label" for="excel0">Download Excel</label>
+          </div>
+          <div class="form-check">
+            <input class="form-check-input" type="radio" name="output_mode" id="csv0" value="csv" {% if om == 'csv' %}checked{% endif %}>
+            <label class="form-check-label" for="csv0">Download CSV</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="col-12 d-flex gap-2">
+        <button type="submit" class="btn btn-primary">Check Liveness</button>
+        <details class="ms-2">
+          <summary>CSV Tips</summary>
+          <ul class="mt-2 mb-0">
+            <li>Prefer UTF-8 CSV with headers.</li>
+            <li>Put hostnames in a column named “site,” or specify custom column names above.</li>
+            <li>Both <code>example.com</code> and <code>https://example.com/foo</code> are supported.</li>
+            <li>For large datasets, use CSV or Excel output instead of the on-page table.</li>
+          </ul>
+        </details>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% if results.table_rows is defined and results.table_rows %}
+  <hr class="my-4">
+
+  <h5 class="mb-2">Results</h5>
+  <ul class="list-unstyled small text-muted">
+    <li>Rows: {{ results.total_rows }}</li>
+    <li>OK: {{ results.ok_rows }}</li>
+    <li>Errors: {{ results.error_rows }}</li>
+    {% if results.live_rows is defined %}
+      <li>Live rows: {{ results.live_rows }}</li>
+    {% endif %}
+  </ul>
+
+  <div class="table-responsive">
+    <table id="resultsTable" class="table table-striped table-hover align-middle">
+      <thead>
+        <tr>
+          {% set cols = results.table_rows[0].keys() %}
+          {% for col in cols %}
+            <th class="sortable" data-col="{{ col|e }}">{{ col }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in results.table_rows %}
+          <tr>
+            {% for col in cols %}
+              {% set val = row[col] %}
+              {% if val is string and val.startswith('http') %}
+                <td style="max-width: 480px; word-break: break-all;">
+                  <a href="{{ val }}" target="_blank" rel="noopener">{{ val }}</a>
+                </td>
+              {% elif val is boolean %}
+                <td>
+                  {% if val %}
+                    <span class="badge text-bg-success">True</span>
+                  {% else %}
+                    <span class="badge text-bg-secondary">False</span>
+                  {% endif %}
+                </td>
+              {% else %}
+                <td>{{ val if val is not none else '' }}</td>
+              {% endif %}
+            {% endfor %}
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <p class="small text-muted">Tip: Click a column header to sort. Use CSV/Excel downloads for large datasets.</p>
+{% endif %}
+
+{# Minimal client-side sorting #}
+<script>
+(function () {
+  const table = document.getElementById('resultsTable');
+  if (!table) return;
+
+  const getCellVal = (tr, idx) => tr.children[idx].innerText || tr.children[idx].textContent;
+
+  const comparer = (idx, asc) => (a, b) => {
+    const v1 = (asc ? getCellVal(a, idx) : getCellVal(b, idx)).trim();
+    const v2 = (asc ? getCellVal(b, idx) : getCellVal(a, idx)).trim();
+
+    const n1 = parseFloat(v1.replace(/,/g, ''));
+    const n2 = parseFloat(v2.replace(/,/g, ''));
+    if (!isNaN(n1) && !isNaN(n2)) return n1 - n2;
+
+    const d1 = Date.parse(v1);
+    const d2 = Date.parse(v2);
+    if (!isNaN(d1) && !isNaN(d2)) return d1 - d2;
+
+    return v1.localeCompare(v2);
+  };
+
+  table.querySelectorAll('th.sortable').forEach((th, idx) => {
+    th.style.cursor = 'pointer';
+    th.addEventListener('click', function () {
+      const tbody = table.tBodies[0];
+      const rows = Array.from(tbody.querySelectorAll('tr'));
+      const asc = !this.classList.contains('asc');
+      table.querySelectorAll('th.sortable').forEach(h => h.classList.remove('asc','desc'));
+      this.classList.add(asc ? 'asc' : 'desc');
+      rows.sort(comparer(idx, asc)).forEach(tr => tbody.appendChild(tr));
+    });
+  });
+})();
+</script>
+
+{% endblock %}

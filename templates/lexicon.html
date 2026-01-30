@@ -3,19 +3,6 @@
 <h2>Lexical/Sentiment Analysis</h2>
 
 <form method="post" enctype="multipart/form-data">
-  <!-- Language selector -->
-  <div class="mb-3">
-    <label class="form-label">Language</label>
-    {% set current_lang = request.form.lang or 'en' %}
-    <select name="lang" class="form-select">
-      <option value="en" {% if current_lang == 'en' %}selected{% endif %}>English</option>
-      <option value="es" {% if current_lang == 'es' %}selected{% endif %}>Español</option>
-    </select>
-    <div class="form-text">
-      English uses VADER for sentiment; Spanish uses a lightweight, lexicon-based negative-intensity score.
-    </div>
-  </div>
-
   <div class="mb-3">
     <label class="form-label">CSV OR Excel File</label>
     <input type="file" name="csv_file" class="form-control" accept=".csv,.xlsx,.xlsm,.xlsb,.xls">
@@ -71,6 +58,7 @@
       {% set es = request.form.get('enable_sentiment', 'on') %}
       {% set esp = request.form.get('enable_social_profiles', 'on') %}
       {% set ekp = request.form.get('enable_key_phrases', 'on') %}
+      {% set eo = request.form.get('enrich_only') %}
       <div class="col-md-3">
         <div class="form-check">
           <input class="form-check-input" type="checkbox" id="enable_tokens" name="enable_tokens" {% if et %}checked{% endif %}>
@@ -106,11 +94,19 @@
         </div>
         <div class="form-text">Uses KeyBERT to extract meaningful phrases from text.</div>
       </div>
+      <div class="col-md-3">
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" id="enrich_only" name="enrich_only" {% if eo %}checked{% endif %}>
+          <label class="form-check-label" for="enrich_only">Enrich rows only (no summaries)</label>
+        </div>
+        <div class="form-text">Adds derived columns and skips summary tables. CSV exports always use the enriched rows.</div>
+      </div>
     </div>
   </div>
 
   <button class="btn btn-primary" type="submit">Display Analysis in Browser</button>
   <button name="format" value="excel" class="btn btn-secondary" type="submit">Download Analysis as Excel</button>
+  <button name="format" value="csv" class="btn btn-outline-secondary" type="submit">Download Enriched CSV</button>
 </form>
 
 {% if results.group_freqs %}
@@ -307,8 +303,8 @@
     <thead>
       <tr>
         <th>Group</th>
-        <th>Count Nonzero</th>
-        <th>Mean Negative Intensity</th>
+        <th>Count</th>
+        <th>Mean Score</th>
         <th>95% CI</th>
       </tr>
     </thead>
@@ -316,8 +312,8 @@
       {% for r in results.sentiment_summary %}
         <tr>
           <td>{{ r['group'] }}</td>
-          <td>{{ r['count_nonzero'] }}</td>
-          <td>{{ "%.3f"|format(r['mean_neg_intensity']) }}</td>
+          <td>{{ r['count'] }}</td>
+          <td>{{ "%.3f"|format(r['mean_score']) }}</td>
           <td>{{ "%.3f"|format(r['95ci_lower']) }} – {{ "%.3f"|format(r['95ci_upper']) }}</td>
         </tr>
       {% endfor %}

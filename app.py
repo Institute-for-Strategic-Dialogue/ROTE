@@ -3,7 +3,7 @@ import os
 import secrets
 from flask import Flask, render_template
 from text_extractor import text_bp
-#from lexicon import lexicon_bp
+from lexicon import lexicon_bp
 from yt_oembed import yt_oembed_bp
 from temporal_analyzer import temporal_bp
 from tiktok_ads import tiktok_ads_bp
@@ -12,12 +12,15 @@ from wikidata_fetcher import wikidata_bp
 from serp_social import serp_social_bp
 from link_unshorten import link_unshorten_bp
 from crypto_transfers import crypto_transfers_bp
+from site_liveness import site_liveness_bp
+from site_downloader import site_downloader_bp  
+from text_cluster import text_cluster_bp
 
 app = Flask(__name__)
 # Use a stable env var in prod; fall back to a strong random for dev.
 app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY") or secrets.token_urlsafe(32)
 app.register_blueprint(text_bp, url_prefix='/extract')
-#app.register_blueprint(lexicon_bp, url_prefix='/lexicon')
+app.register_blueprint(lexicon_bp, url_prefix='/lexicon')
 app.register_blueprint(yt_oembed_bp, url_prefix='/youtube')
 app.register_blueprint(temporal_bp, url_prefix='/temporal')
 app.register_blueprint(tiktok_ads_bp, url_prefix="/tiktok")
@@ -26,7 +29,10 @@ app.register_blueprint(wikidata_bp, url_prefix="/wikidata")
 app.register_blueprint(serp_social_bp, url_prefix="/serp_social")
 app.register_blueprint(link_unshorten_bp, url_prefix="/link_unshorten")
 app.register_blueprint(crypto_transfers_bp, url_prefix="/crypto_transfers")
-# TODO: add blueprint for downloading sites based on RSS feeds or sitemaps
+app.register_blueprint(site_liveness_bp, url_prefix="/site_liveness")
+app.register_blueprint(site_downloader_bp, url_prefix="/site_downloader")
+app.register_blueprint(text_cluster_bp, url_prefix="/text_cluster") 
+# TODO: add a blueprint/tool that clusters text documents based on semantic similarity e.g. "This is insane! check out tthis AI nudifier" vs "Look at this crazy deepfake porn generator" should be similar, where "cats are friendly and cute" is very different; clusters can be of any size. Maybe use KNN?
 # TODO: Add a GDELT wrapper 
 
 @app.route('/')
@@ -39,13 +45,13 @@ def index():
             "icon": "fa-regular fa-file-lines",
             "bg": "bg-tool-indigo"
         },
-        # {
-        #     "name": "Lexicon CSV Enricher",
-        #     "description": "Extract links, “@” mentions, named entities, sentiment, and hashtags from CSV files.",
-        #     "url": "/lexicon",
-        #     "icon": "fa-solid fa-spell-check",
-        #     "bg": "bg-tool-teal"
-        # },
+        {
+            "name": "Lexicon CSV Enricher",
+            "description": "Extract links, “@” mentions, named entities, sentiment, and hashtags from CSV files.",
+            "url": "/lexicon",
+            "icon": "fa-solid fa-spell-check",
+            "bg": "bg-tool-teal"
+        },
         {
             "name": "YouTube Metadata Extractor",
             "description": "Extract metadata from YouTube videos.",
@@ -101,7 +107,29 @@ def index():
             "url": "/crypto_transfers",
             "icon": "fa-brands fa-bitcoin",
             "bg": "bg-tool-orange"
-        }
+        },
+        {
+            "name": "Site Liveness Checker",
+            "description": "Check if websites are live or down from lists of URLs.",
+            "url": "/site_liveness",
+            "icon": "fa-solid fa-signal",
+            "bg": "bg-tool-black"
+        },
+        {
+            "name": "Site Downloader",
+            "description": "UNDER CONSTRUCTION: Download website content for offline analysis.",
+            "url": "/site_downloader",
+            "icon": "fa-solid fa-download",
+            "bg": "bg-tool-cyan"
+        },
+        {
+            "name": "Text Clustering Tool",
+            "description": "Cluster text documents based on semantic similarity.",
+            "url": "/text_cluster",
+            "icon": "fa-solid fa-object-group",
+            "bg": "bg-tool-indigo"
+        },
+        
     ]
     return render_template('index.html', tools=tools)
 
