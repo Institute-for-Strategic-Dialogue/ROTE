@@ -1,14 +1,16 @@
-Flask==3.1.2
-nltk==3.8.1
-numpy==2.3.2
-pandas==2.3.2
-python_dateutil==2.8.2
-Requests==2.32.5
+Flask
+nltk
+numpy
+pandas
+python_dateutil
+Requests
 # Wikidata client used by wikidata_fetcher
 wikidata
-# spacy==3.7.5
-SQLAlchemy==2.0.28
-# vaderSentiment==3.3.2
-# vaderSentiment==3.3.2
-networkx==3.5
-xlsxwriter==3.2.9   
+spacy
+SQLAlchemy
+vaderSentiment
+networkx
+xlsxwriter
+keybert
+lxml
+sentence_transformers
