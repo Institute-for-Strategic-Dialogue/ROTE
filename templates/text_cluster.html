@@ -18,12 +18,27 @@
     <div class="form-text">CSV: uses the <code>text</code> column if present, otherwise the first column. Processes up to {{ max_docs }} rows.</div>
   </div>
   <div class="row g-3 align-items-end">
-    <div class="col-sm-4">
+    <div class="col-sm-3">
       <label class="form-label">Similarity threshold</label>
       <input class="form-control" type="number" name="threshold" step="0.05" min="0.3" max="0.95" value="{{ '%.2f'|format(threshold) }}">
-      <div class="form-text">Higher = stricter clusters (default 0.60).</div>
+      <div class="form-text">Higher = stricter clusters.</div>
     </div>
-    <div class="col-sm-4">
+    <div class="col-sm-3">
+      <label class="form-label">Min cluster size</label>
+      <input class="form-control" type="number" name="min_cluster_size" min="1" step="1" value="{{ min_cluster_size }}">
+      <div class="form-text">Clusters smaller than this are left unassigned.</div>
+    </div>
+    <div class="col-sm-3">
+      <label class="form-label">Output</label>
+      <select class="form-select" name="output_mode">
+        {% set mode = request.form.get("output_mode", "table") %}
+        <option value="table" {% if mode == "table" %}selected{% endif %}>Table</option>
+        <option value="csv" {% if mode == "csv" %}selected{% endif %}>Download CSV</option>
+        <option value="excel" {% if mode == "excel" %}selected{% endif %}>Download Excel</option>
+      </select>
+      <div class="form-text">Downloads include original columns + cluster_id, cluster_size.</div>
+    </div>
+    <div class="col-sm-3">
       <button class="btn btn-primary" type="submit">Cluster texts</button>
     </div>
   </div>
