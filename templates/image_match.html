@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row mb-4">
+  <div class="col-lg-8">
+    <h1 class="h3 mb-2">Image Matcher</h1>
+    <p class="text-muted">Upload images, zip archives, or paste image URLs to find exact and near-duplicate matches using perceptual hashing. Use <strong>in-group</strong> mode to find duplicates within one set, or <strong>source vs dataset</strong> to match a smaller set of reference images against a larger collection.</p>
+  </div>
+</div>
+
+<form method="post" enctype="multipart/form-data" class="mb-4">
+
+  <!-- Mode selector -->
+  <div class="mb-3">
+    <label class="form-label fw-semibold">Matching mode</label>
+    <div class="form-check">
+      <input class="form-check-input" type="radio" name="match_mode" id="mode_ingroup"
+             value="ingroup" {% if match_mode == 'ingroup' %}checked{% endif %}
+             onchange="document.getElementById('ingroup_section').style.display='block'; document.getElementById('source_section').style.display='none';">
+      <label class="form-check-label" for="mode_ingroup">In-group &mdash; find all matching pairs within one set</label>
+    </div>
+    <div class="form-check">
+      <input class="form-check-input" type="radio" name="match_mode" id="mode_source"
+             value="source_vs_dataset" {% if match_mode == 'source_vs_dataset' %}checked{% endif %}
+             onchange="document.getElementById('ingroup_section').style.display='none'; document.getElementById('source_section').style.display='block';">
+      <label class="form-check-label" for="mode_source">Source vs Dataset &mdash; match reference images against a larger set</label>
+    </div>
+  </div>
+
+  <!-- In-group upload -->
+  <div id="ingroup_section" style="display: {% if match_mode == 'ingroup' %}block{% else %}none{% endif %};">
+    <div class="mb-3">
+      <label class="form-label">Upload images</label>
+      <input class="form-control" type="file" name="ingroup_images" accept="image/*,.zip" multiple>
+      <div class="form-text">Select multiple image files or a .zip archive. Up to {{ max_images }} images.</div>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Or paste image URLs (one per line)</label>
+      <textarea class="form-control" name="ingroup_urls" rows="4" placeholder="https://example.com/photo1.jpg&#10;https://example.com/photo2.png">{{ request.form.get("ingroup_urls", "") }}</textarea>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Or upload a file of URLs</label>
+      <input class="form-control" type="file" name="ingroup_url_file" accept=".csv,.txt,.tsv">
+      <div class="form-text">CSV (auto-detects url/image_url/media_url/link column) or plain text with one URL per line.</div>
+    </div>
+  </div>
+
+  <!-- Source vs Dataset uploads -->
+  <div id="source_section" style="display: {% if match_mode == 'source_vs_dataset' %}block{% else %}none{% endif %};">
+    <div class="mb-3">
+      <label class="form-label">Source images (reference set)</label>
+      <input class="form-control" type="file" name="source_images" accept="image/*,.zip" multiple>
+      <div class="form-text">The smaller set of images you want to find matches for.</div>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Or paste source image URLs (one per line)</label>
+      <textarea class="form-control" name="source_urls" rows="3" placeholder="https://example.com/reference.jpg">{{ request.form.get("source_urls", "") }}</textarea>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Or upload a file of source URLs</label>
+      <input class="form-control" type="file" name="source_url_file" accept=".csv,.txt,.tsv">
+      <div class="form-text">CSV or plain text with one URL per line.</div>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Dataset images (search against)</label>
+      <input class="form-control" type="file" name="dataset_images" accept="image/*,.zip" multiple>
+      <div class="form-text">The larger collection to search within.</div>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Or paste dataset image URLs (one per line)</label>
+      <textarea class="form-control" name="dataset_urls" rows="3" placeholder="https://example.com/image1.jpg&#10;https://example.com/image2.png">{{ request.form.get("dataset_urls", "") }}</textarea>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Or upload a file of dataset URLs</label>
+      <input class="form-control" type="file" name="dataset_url_file" accept=".csv,.txt,.tsv">
+      <div class="form-text">CSV or plain text with one URL per line.</div>
+    </div>
+  </div>
+
+  <div class="row g-3 align-items-end">
+    <div class="col-sm-3">
+      <label class="form-label">Hash distance threshold</label>
+      <input class="form-control" type="number" name="threshold" min="0" max="64" step="1" value="{{ threshold }}">
+      <div class="form-text"><strong>0</strong> = exact matches only. Higher values allow more variation (try 5&ndash;15 for near-duplicates).</div>
+    </div>
+    <div class="col-sm-3">
+      <label class="form-label">Output</label>
+      <select class="form-select" name="output_mode">
+        {% set mode = request.form.get("output_mode", "table") %}
+        <option value="table" {% if mode == "table" %}selected{% endif %}>Table</option>
+        <option value="csv" {% if mode == "csv" %}selected{% endif %}>Download CSV</option>
+        <option value="excel" {% if mode == "excel" %}selected{% endif %}>Download Excel</option>
+      </select>
+    </div>
+    <div class="col-sm-3">
+      <button class="btn btn-primary" type="submit">Find matches</button>
+    </div>
+  </div>
+</form>
+
+{% if error %}
+  <div class="alert alert-warning">{{ error }}</div>
+{% endif %}
+
+{% if matches %}
+  <div class="mb-3">
+    <strong>{{ matches|length }}</strong> match{{ 'es' if matches|length != 1 else '' }} found across <strong>{{ total_images }}</strong> images.
+  </div>
+
+  <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
+    <table class="table table-sm table-striped mb-0">
+      <thead class="table-light sticky-top">
+        <tr>
+          {% if match_mode == 'source_vs_dataset' %}
+            <th>Source Image</th>
+            <th>Dataset Image</th>
+          {% else %}
+            <th>Image A</th>
+            <th>Image B</th>
+          {% endif %}
+          <th class="text-end" style="width:100px">Distance</th>
+          <th class="text-center" style="width:80px">Exact</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in matches[:500] %}
+          <tr>
+            {% if match_mode == 'source_vs_dataset' %}
+              <td class="text-break">{{ m.source_image }}</td>
+              <td class="text-break">{{ m.dataset_image }}</td>
+            {% else %}
+              <td class="text-break">{{ m.image_a }}</td>
+              <td class="text-break">{{ m.image_b }}</td>
+            {% endif %}
+            <td class="text-end">{{ m.distance }}</td>
+            <td class="text-center">{% if m.exact %}<span class="badge bg-success">Yes</span>{% else %}<span class="badge bg-secondary">No</span>{% endif %}</td>
+          </tr>
+        {% endfor %}
+        {% if matches|length > 500 %}
+          <tr><td colspan="4" class="text-muted text-center">Showing top 500 of {{ matches|length }}. Download for full results.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+{% elif request.method == "POST" and not error %}
+  <div class="alert alert-info">No matches found at distance threshold {{ threshold }}.</div>
+{% endif %}
+{% endblock %}

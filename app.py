@@ -15,6 +15,8 @@ from crypto_transfers import crypto_transfers_bp
 from site_liveness import site_liveness_bp
 from site_downloader import site_downloader_bp  
 from text_cluster import text_cluster_bp
+from bw_grouping import bw_grouping_bp
+from image_match import image_match_bp
 
 app = Flask(__name__)
 # Use a stable env var in prod; fall back to a strong random for dev.
@@ -31,7 +33,9 @@ app.register_blueprint(link_unshorten_bp, url_prefix="/link_unshorten")
 app.register_blueprint(crypto_transfers_bp, url_prefix="/crypto_transfers")
 app.register_blueprint(site_liveness_bp, url_prefix="/site_liveness")
 app.register_blueprint(site_downloader_bp, url_prefix="/site_downloader")
-app.register_blueprint(text_cluster_bp, url_prefix="/text_cluster") 
+app.register_blueprint(text_cluster_bp, url_prefix="/text_cluster")
+app.register_blueprint(bw_grouping_bp, url_prefix="/bw_grouping")
+app.register_blueprint(image_match_bp, url_prefix="/image_match")
 # TODO: add a blueprint/tool that clusters text documents based on semantic similarity e.g. "This is insane! check out tthis AI nudifier" vs "Look at this crazy deepfake porn generator" should be similar, where "cats are friendly and cute" is very different; clusters can be of any size. Maybe use KNN?
 # TODO: Add a GDELT wrapper 
 
@@ -129,7 +133,30 @@ def index():
             "icon": "fa-solid fa-object-group",
             "bg": "bg-tool-indigo"
         },
+        {
+            "name": "BW Grouping",
+            "description": "Aggregate Brandwatch multi-value columns (URLs, reposts, replies, tokens) and count mentions.",
+            "url": "/bw_grouping",
+            "icon": "fa-solid fa-layer-group",
+            "bg": "bg-tool-teal"
+        },
+        {
+            "name": "Image Matcher",
+            "description": "Find exact and near-duplicate images using perceptual hashing, within one set or across two sets.",
+            "url": "/image_match",
+            "icon": "fa-solid fa-images",
+            "bg": "bg-tool-purple"
+        },
         
+        # --- External tools (linked out) ---
+        {
+            "name": "ISD Archiver",
+            "description": "Archive and preserve web pages, social media posts, and other online content.",
+            "url": "https://archive.isd.ngo",
+            "icon": "fa-solid fa-box-archive",
+            "bg": "bg-tool-slate",
+            "external": True
+        },
     ]
     return render_template('index.html', tools=tools)
 

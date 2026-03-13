@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row mb-4">
+  <div class="col-lg-8">
+    <h1 class="h3 mb-2">BW Grouping</h1>
+    <p class="text-muted">Upload a Brandwatch export (CSV or Excel) to aggregate multi-value columns. Each value is split on <code>, </code> (comma + space) and counted across all mentions. Tokens are extracted from <strong>Full Text</strong> and filtered by stopwords.</p>
+  </div>
+</div>
+
+<form method="post" enctype="multipart/form-data" class="mb-4">
+  <div class="mb-3">
+    <label class="form-label">Upload Brandwatch file</label>
+    <input class="form-control" type="file" name="bw_file" accept=".csv,.xlsx,.xls" required>
+    <div class="form-text">Accepted formats: CSV, Excel (.xlsx / .xls). Up to 100,000 rows.</div>
+  </div>
+  <div class="row g-3 align-items-end">
+    <div class="col-sm-3">
+      <label class="form-label">Output</label>
+      <select class="form-select" name="output_mode">
+        {% set mode = request.form.get("output_mode", "table") %}
+        <option value="table" {% if mode == "table" %}selected{% endif %}>Table</option>
+        <option value="csv" {% if mode == "csv" %}selected{% endif %}>Download CSV</option>
+        <option value="excel" {% if mode == "excel" %}selected{% endif %}>Download Excel</option>
+      </select>
+    </div>
+    <div class="col-sm-3">
+      <button class="btn btn-primary" type="submit">Aggregate</button>
+    </div>
+  </div>
+</form>
+
+{% if error is defined and error %}
+  <div class="alert alert-warning">{{ error }}</div>
+{% endif %}
+
+{% if results %}
+  <div class="mb-3">
+    <strong>{{ total_rows }}</strong> mentions processed.
+  </div>
+
+  {% for dim, counter in results.items() %}
+    <div class="card mb-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <div><strong>{{ dim }}</strong></div>
+        <span class="badge bg-secondary">{{ counter|length }} unique value{{ 's' if counter|length != 1 else '' }}</span>
+      </div>
+      <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+        <table class="table table-sm table-striped mb-0">
+          <thead class="table-light sticky-top">
+            <tr><th>Value</th><th class="text-end" style="width:100px">Mentions</th></tr>
+          </thead>
+          <tbody>
+            {% for val, cnt in counter.most_common(200) %}
+              <tr>
+                <td class="text-break">{{ val }}</td>
+                <td class="text-end">{{ cnt }}</td>
+              </tr>
+            {% endfor %}
+            {% if counter|length > 200 %}
+              <tr><td colspan="2" class="text-muted text-center">Showing top 200 of {{ counter|length }}. Download for full results.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% endfor %}
+{% elif request.method == "POST" and not (error is defined and error) %}
+  <div class="alert alert-info">No matching columns found in the uploaded file.</div>
+{% endif %}
+{% endblock %}

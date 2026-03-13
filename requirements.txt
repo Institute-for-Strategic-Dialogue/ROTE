@@ -14,3 +14,5 @@ xlsxwriter
 keybert
 lxml
 sentence_transformers
+Pillow
+ImageHash
