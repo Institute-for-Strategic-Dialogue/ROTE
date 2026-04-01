@@ -1,0 +1,548 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row mb-4">
+  <div class="col-lg-8">
+    <h1 class="h3 mb-2">Keyword Discovery</h1>
+    <p class="text-muted">
+      Start with seed keywords and iteratively expand your list using co-occurrence analysis,
+      distributional similarity, and graph-based community discovery.
+    </p>
+  </div>
+</div>
+
+<!-- Corpus upload -->
+<div class="card mb-4" id="upload-card">
+  <div class="card-header">Corpus</div>
+  <div class="card-body">
+    <div id="corpus-info" class="alert alert-info d-none mb-3"></div>
+    <form id="upload-form" enctype="multipart/form-data">
+      <div class="row g-3 align-items-end">
+        <div class="col-sm-4">
+          <label class="form-label">Upload CSV or JSON</label>
+          <input class="form-control" type="file" name="corpus_file" id="corpus-file" accept=".csv,.json" required>
+        </div>
+        <div class="col-sm-3">
+          <label class="form-label">Text column <small class="text-muted">(optional)</small></label>
+          <input class="form-control" type="text" name="text_column" id="text-column" placeholder="Auto-detect">
+        </div>
+        <div class="col-sm-2">
+          <label class="form-label">Min doc freq</label>
+          <input class="form-control" type="number" name="min_df" id="upload-min-df" value="2" min="1">
+        </div>
+        <div class="col-sm-3">
+          <button class="btn btn-primary w-100" type="submit" id="upload-btn">Upload corpus</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Seed input + settings -->
+<div class="card mb-4" id="seed-card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span>Seeds &amp; Settings</span>
+    <small id="seed-mode-label" class="text-muted"></small>
+  </div>
+  <div class="card-body">
+    <div class="row g-3 mb-3">
+      <div class="col-md-8">
+        <label class="form-label">Seed keywords</label>
+        <textarea class="form-control" id="seed-input" rows="3"
+          placeholder="Comma-separated keywords, e.g.: globalist, great replacement, cabal&#10;&#10;Or a boolean expression: (globalist OR cabal) AND NOT news">{{ state.current_seeds | join(', ') }}</textarea>
+      </div>
+      <div class="col-md-4">
+        <label class="form-label">Exclude list <small class="text-muted">(stem-filtered, accumulates)</small></label>
+        <textarea class="form-control" id="exclude-input" rows="3"
+          placeholder="Comma-separated terms to exclude,&#10;e.g.: news, reporter, journalist">{{ state.excluded | join(', ') }}</textarea>
+      </div>
+    </div>
+    <div class="row g-3 align-items-end">
+      <div class="col-sm-2">
+        <label class="form-label">Min doc freq</label>
+        <input class="form-control" type="number" id="min-df" value="5" min="1">
+      </div>
+      <div class="col-sm-2">
+        <label class="form-label">Max candidates</label>
+        <input class="form-control" type="number" id="top-n" value="50" min="1" max="200">
+      </div>
+      <div class="col-sm-3">
+        <label class="form-label">N-gram range</label>
+        <select class="form-select" id="ngram-range">
+          <option value="1">Unigrams only</option>
+          <option value="2" selected>Uni + bigrams</option>
+          <option value="3">Uni + bi + trigrams</option>
+        </select>
+      </div>
+      <div class="col-sm-5">
+        <button class="btn btn-primary w-100" id="discover-btn" disabled>
+          <span id="discover-text">Discover terms</span>
+          <span id="discover-spinner" class="spinner-border spinner-border-sm d-none" role="status"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Results panel -->
+<div id="results-panel" class="d-none">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <div id="results-summary" class="fw-bold"></div>
+    <div>
+      <button class="btn btn-sm btn-outline-secondary me-1" id="undo-btn" disabled>Undo last round</button>
+    </div>
+  </div>
+
+  <div id="errors-alert" class="alert alert-warning d-none"></div>
+
+  <!-- Candidate table -->
+  <div class="card mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <span>Candidates</span>
+      <div>
+        <button class="btn btn-sm btn-outline-success me-1" id="include-all-btn">Include all</button>
+        <button class="btn btn-sm btn-outline-secondary" id="clear-all-btn">Clear all</button>
+      </div>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-hover mb-0" id="candidates-table">
+        <thead>
+          <tr>
+            <th style="width:50px" class="text-center text-success" title="Add to seeds"><i class="fa-solid fa-plus"></i></th>
+            <th style="width:50px" class="text-center text-danger" title="Add to exclude list"><i class="fa-solid fa-ban"></i></th>
+            <th>Term</th>
+            <th style="width:120px">Score</th>
+            <th>Source(s)</th>
+            <th>Context</th>
+            <th style="width:70px"># Posts</th>
+          </tr>
+        </thead>
+        <tbody id="candidates-body"></tbody>
+      </table>
+    </div>
+    <div class="card-footer">
+      <div class="d-flex gap-2">
+        <button class="btn btn-success" id="add-rerun-btn">Add included &amp; rerun</button>
+        <button class="btn btn-outline-secondary" id="dismiss-btn">Dismiss unmarked</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Chain history -->
+<div id="history-panel" class="d-none mb-4">
+  <div class="card">
+    <div class="card-header">
+      <a class="text-decoration-none" data-bs-toggle="collapse" href="#chain-history">
+        Chain history
+      </a>
+    </div>
+    <div class="collapse" id="chain-history">
+      <ul class="list-group list-group-flush" id="history-list"></ul>
+    </div>
+  </div>
+</div>
+
+<!-- Export -->
+<div id="export-panel" class="d-none mb-4">
+  <div class="dropdown">
+    <button class="btn btn-outline-secondary dropdown-toggle" data-bs-toggle="dropdown">Export</button>
+    <ul class="dropdown-menu">
+      <li><a class="dropdown-item" href="#" onclick="exportData('json')">JSON (full chain state)</a></li>
+      <li><a class="dropdown-item" href="#" onclick="exportData('csv')">CSV (flat keyword list)</a></li>
+      <li><a class="dropdown-item" href="#" onclick="exportData('boolean')">Boolean query</a></li>
+      <li><a class="dropdown-item" href="#" onclick="exportData('graphml')">GraphML (network graph)</a></li>
+    </ul>
+  </div>
+</div>
+
+<script>
+(function() {
+  "use strict";
+
+  const BASE = "{{ request.script_root }}{{ url_for('keyword_discovery.index') }}".replace(/\/$/, "");
+
+  let corpusLoaded = {{ 'true' if has_corpus else 'false' }};
+  let currentCandidates = [];
+
+  // DOM refs
+  const uploadForm = document.getElementById("upload-form");
+  const corpusInfo = document.getElementById("corpus-info");
+  const discoverBtn = document.getElementById("discover-btn");
+  const discoverText = document.getElementById("discover-text");
+  const discoverSpinner = document.getElementById("discover-spinner");
+  const seedInput = document.getElementById("seed-input");
+  const seedModeLabel = document.getElementById("seed-mode-label");
+  const resultsPanel = document.getElementById("results-panel");
+  const resultsSummary = document.getElementById("results-summary");
+  const errorsAlert = document.getElementById("errors-alert");
+  const candidatesBody = document.getElementById("candidates-body");
+  const historyPanel = document.getElementById("history-panel");
+  const historyList = document.getElementById("history-list");
+  const exportPanel = document.getElementById("export-panel");
+  const undoBtn = document.getElementById("undo-btn");
+
+  function updateSeedMode() {
+    const text = seedInput.value.toUpperCase();
+    if (/\b(AND|OR|NOT)\b/.test(text) || /[()]/.test(text)) {
+      seedModeLabel.textContent = "Boolean mode";
+    } else {
+      seedModeLabel.textContent = "Keyword list mode";
+    }
+  }
+  seedInput.addEventListener("input", updateSeedMode);
+  updateSeedMode();
+
+  // Enable discover button when corpus is loaded
+  function checkReady() {
+    discoverBtn.disabled = !corpusLoaded;
+  }
+
+  {% if has_corpus %}
+  corpusInfo.textContent = "Corpus loaded: {{ state.corpus_filename }} ({{ state.total_docs }} docs, {{ state.unique_terms }} terms)";
+  corpusInfo.classList.remove("d-none");
+  checkReady();
+  {% endif %}
+
+  // Upload corpus
+  uploadForm.addEventListener("submit", function(e) {
+    e.preventDefault();
+    const fd = new FormData(uploadForm);
+    const btn = document.getElementById("upload-btn");
+    btn.disabled = true;
+    btn.textContent = "Uploading...";
+
+    fetch(BASE + "/upload", { method: "POST", body: fd })
+      .then(r => r.json())
+      .then(data => {
+        btn.disabled = false;
+        btn.textContent = "Upload corpus";
+        if (data.error) {
+          corpusInfo.textContent = "Error: " + data.error;
+          corpusInfo.className = "alert alert-danger mb-3";
+          corpusInfo.classList.remove("d-none");
+          return;
+        }
+        corpusLoaded = true;
+        corpusInfo.textContent = "Corpus loaded: " + data.filename +
+          " (" + data.total_docs + " docs, " + data.unique_terms + " terms, column: " + data.text_column + ")";
+        corpusInfo.className = "alert alert-info mb-3";
+        corpusInfo.classList.remove("d-none");
+        checkReady();
+      })
+      .catch(err => {
+        btn.disabled = false;
+        btn.textContent = "Upload corpus";
+        corpusInfo.textContent = "Upload failed: " + err;
+        corpusInfo.className = "alert alert-danger mb-3";
+        corpusInfo.classList.remove("d-none");
+      });
+  });
+
+  // Source badge classes
+  const SOURCE_BADGES = {
+    cooccurrence: "bg-primary",
+    semantic: "bg-success",
+    network: "bg-info text-dark",
+    corpus_specific: "bg-warning text-dark"
+  };
+  const SOURCE_LABELS = {
+    cooccurrence: "co-occurrence",
+    semantic: "distributional",
+    network: "network",
+    corpus_specific: "corpus-specific"
+  };
+
+  function renderCandidates(candidates) {
+    currentCandidates = candidates;
+    candidatesBody.innerHTML = "";
+
+    candidates.forEach(function(c, idx) {
+      const tr = document.createElement("tr");
+      tr.className = "candidate-row";
+      tr.dataset.idx = idx;
+
+      // Include checkbox (green +)
+      const tdInclude = document.createElement("td");
+      tdInclude.className = "text-center";
+      const cbInclude = document.createElement("input");
+      cbInclude.type = "checkbox";
+      cbInclude.className = "include-check";
+      cbInclude.dataset.term = c.term;
+      tdInclude.appendChild(cbInclude);
+      tr.appendChild(tdInclude);
+
+      // Exclude checkbox (red ban)
+      const tdExclude = document.createElement("td");
+      tdExclude.className = "text-center";
+      const cbExclude = document.createElement("input");
+      cbExclude.type = "checkbox";
+      cbExclude.className = "exclude-check";
+      cbExclude.dataset.term = c.term;
+      tdExclude.appendChild(cbExclude);
+      tr.appendChild(tdExclude);
+
+      // Mutual exclusion: checking include unchecks exclude and vice versa
+      cbInclude.addEventListener("change", function() {
+        if (cbInclude.checked) cbExclude.checked = false;
+      });
+      cbExclude.addEventListener("change", function() {
+        if (cbExclude.checked) cbInclude.checked = false;
+      });
+
+      // Term
+      const tdTerm = document.createElement("td");
+      tdTerm.className = "fw-semibold";
+      tdTerm.textContent = c.term;
+      tr.appendChild(tdTerm);
+
+      // Score bar
+      const tdScore = document.createElement("td");
+      const barOuter = document.createElement("div");
+      barOuter.className = "progress";
+      barOuter.style.height = "8px";
+      const barInner = document.createElement("div");
+      barInner.className = "progress-bar";
+      barInner.style.width = (c.score * 100).toFixed(0) + "%";
+      barOuter.appendChild(barInner);
+      const scoreLabel = document.createElement("small");
+      scoreLabel.className = "text-muted";
+      scoreLabel.textContent = c.score.toFixed(3);
+      tdScore.appendChild(barOuter);
+      tdScore.appendChild(scoreLabel);
+      tr.appendChild(tdScore);
+
+      // Source badges
+      const tdSource = document.createElement("td");
+      (c.sources || [c.source]).forEach(function(src) {
+        const badge = document.createElement("span");
+        badge.className = "badge me-1 " + (SOURCE_BADGES[src] || "bg-secondary");
+        badge.textContent = SOURCE_LABELS[src] || src.replace("_", " ");
+        tdSource.appendChild(badge);
+      });
+      tr.appendChild(tdSource);
+
+      // Context
+      const tdCtx = document.createElement("td");
+      tdCtx.textContent = c.context;
+      tdCtx.style.maxWidth = "300px";
+      tdCtx.style.fontSize = "0.85rem";
+      tr.appendChild(tdCtx);
+
+      // Doc count
+      const tdCount = document.createElement("td");
+      tdCount.textContent = c.doc_count;
+      tr.appendChild(tdCount);
+
+      candidatesBody.appendChild(tr);
+
+      // Evidence accordion (collapsed by default)
+      if (c.evidence && c.evidence.length > 0) {
+        const trEvidence = document.createElement("tr");
+        trEvidence.className = "d-none evidence-row";
+        trEvidence.dataset.parentIdx = idx;
+        const tdEvidence = document.createElement("td");
+        tdEvidence.colSpan = 7;
+        tdEvidence.className = "bg-light";
+        const ul = document.createElement("ul");
+        ul.className = "list-unstyled mb-0 small";
+        c.evidence.forEach(function(e) {
+          const li = document.createElement("li");
+          li.className = "mb-1 text-muted";
+          li.textContent = e;
+          ul.appendChild(li);
+        });
+        tdEvidence.appendChild(ul);
+        trEvidence.appendChild(tdEvidence);
+        candidatesBody.appendChild(trEvidence);
+
+        tr.style.cursor = "pointer";
+        tr.addEventListener("click", function(ev) {
+          if (ev.target.tagName === "INPUT") return;
+          trEvidence.classList.toggle("d-none");
+        });
+      }
+    });
+  }
+
+  function updateHistory(state) {
+    if (!state || !state.rounds || state.rounds.length === 0) {
+      historyPanel.classList.add("d-none");
+      return;
+    }
+    historyPanel.classList.remove("d-none");
+    historyList.innerHTML = "";
+    state.rounds.forEach(function(rnd) {
+      const li = document.createElement("li");
+      li.className = "list-group-item py-2";
+      const seeds = rnd.seed_keywords.join(", ");
+      let detail = "<strong>Round " + rnd.round_number + "</strong>: " +
+        rnd.seed_keywords.length + " seeds";
+      if (rnd.added_terms && rnd.added_terms.length > 0) {
+        detail += " &rarr; +" + rnd.added_terms.length + " added";
+      }
+      if (rnd.dismissed_terms && rnd.dismissed_terms.length > 0) {
+        detail += ", -" + rnd.dismissed_terms.length + " dismissed";
+      }
+      li.innerHTML = "<small>" + detail + "</small>";
+      historyList.appendChild(li);
+    });
+  }
+
+  // Discover
+  discoverBtn.addEventListener("click", function() {
+    runDiscovery();
+  });
+
+  function runDiscovery() {
+    const seeds = seedInput.value.trim();
+    if (!seeds) return;
+
+    discoverBtn.disabled = true;
+    discoverText.textContent = "Running discovery...";
+    discoverSpinner.classList.remove("d-none");
+    errorsAlert.classList.add("d-none");
+
+    fetch(BASE + "/discover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        seeds: seeds,
+        exclude: document.getElementById("exclude-input").value.trim(),
+        min_df: parseInt(document.getElementById("min-df").value) || 5,
+        top_n: parseInt(document.getElementById("top-n").value) || 50
+      })
+    })
+    .then(r => r.json())
+    .then(data => {
+      discoverBtn.disabled = false;
+      discoverText.textContent = "Discover terms";
+      discoverSpinner.classList.add("d-none");
+
+      if (data.error) {
+        errorsAlert.textContent = data.error;
+        errorsAlert.classList.remove("d-none");
+        return;
+      }
+
+      resultsSummary.textContent = "Round " + data.round_number +
+        " \u2014 " + data.candidate_count + " candidates from " +
+        data.seed_count + " seeds";
+
+      if (data.errors && data.errors.length > 0) {
+        errorsAlert.textContent = "Warnings: " + data.errors.join("; ");
+        errorsAlert.classList.remove("d-none");
+      }
+
+      renderCandidates(data.candidates || []);
+      resultsPanel.classList.remove("d-none");
+      exportPanel.classList.remove("d-none");
+      undoBtn.disabled = false;
+    })
+    .catch(err => {
+      discoverBtn.disabled = false;
+      discoverText.textContent = "Discover terms";
+      discoverSpinner.classList.add("d-none");
+      errorsAlert.textContent = "Request failed: " + err;
+      errorsAlert.classList.remove("d-none");
+    });
+  }
+
+  // Include all / Clear all
+  document.getElementById("include-all-btn").addEventListener("click", function() {
+    document.querySelectorAll(".include-check").forEach(function(cb) { cb.checked = true; });
+    document.querySelectorAll(".exclude-check").forEach(function(cb) { cb.checked = false; });
+  });
+  document.getElementById("clear-all-btn").addEventListener("click", function() {
+    document.querySelectorAll(".include-check").forEach(function(cb) { cb.checked = false; });
+    document.querySelectorAll(".exclude-check").forEach(function(cb) { cb.checked = false; });
+  });
+
+  function gatherSelections() {
+    const added = [], excluded = [], dismissed = [];
+    const rows = document.querySelectorAll(".candidate-row");
+    rows.forEach(function(row) {
+      const inc = row.querySelector(".include-check");
+      const exc = row.querySelector(".exclude-check");
+      if (!inc || !exc) return;
+      const term = inc.dataset.term;
+      if (inc.checked) added.push(term);
+      else if (exc.checked) excluded.push(term);
+      else dismissed.push(term);
+    });
+    return { added, excluded, dismissed };
+  }
+
+  // Add included & rerun
+  document.getElementById("add-rerun-btn").addEventListener("click", function() {
+    const sel = gatherSelections();
+
+    fetch(BASE + "/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sel)
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { alert(data.error); return; }
+      seedInput.value = data.current_seeds.join(", ");
+      // Update exclude textarea with accumulated excludes
+      document.getElementById("exclude-input").value = (data.excluded || []).join(", ");
+      updateSeedMode();
+      runDiscovery();
+    });
+  });
+
+  // Dismiss unmarked (neither included nor excluded)
+  document.getElementById("dismiss-btn").addEventListener("click", function() {
+    const sel = gatherSelections();
+    if (sel.dismissed.length === 0) return;
+
+    fetch(BASE + "/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ added: [], excluded: sel.excluded, dismissed: sel.dismissed })
+    })
+    .then(r => r.json())
+    .then(function(data) {
+      // Update exclude textarea
+      if (data.excluded) {
+        document.getElementById("exclude-input").value = data.excluded.join(", ");
+      }
+      // Remove dismissed rows from table
+      document.querySelectorAll(".candidate-row").forEach(function(row) {
+        const inc = row.querySelector(".include-check");
+        const exc = row.querySelector(".exclude-check");
+        if (inc && !inc.checked && exc && !exc.checked) {
+          const idx = row.dataset.idx;
+          const evRow = document.querySelector('.evidence-row[data-parent-idx="' + idx + '"]');
+          if (evRow) evRow.remove();
+          row.remove();
+        }
+      });
+    });
+  });
+
+  // Undo
+  undoBtn.addEventListener("click", function() {
+    fetch(BASE + "/undo", { method: "POST" })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) { alert(data.error); return; }
+        seedInput.value = data.current_seeds.join(", ");
+        updateSeedMode();
+        if (data.rounds_remaining === 0) {
+          resultsPanel.classList.add("d-none");
+          undoBtn.disabled = true;
+        }
+      });
+  });
+
+  // Export
+  window.exportData = function(fmt) {
+    window.location.href = BASE + "/export?format=" + fmt;
+  };
+
+  checkReady();
+})();
+</script>
+{% endblock %}

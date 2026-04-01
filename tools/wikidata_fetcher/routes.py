@@ -63,7 +63,7 @@ column_to_property: Dict[str, str] = {
 property_id_to_column: Dict[str, str] = {v: k for k, v in column_to_property.items()}
 
 # --- Flask Blueprint ---
-wikidata_bp = Blueprint("wikidata", __name__)
+wikidata_bp = Blueprint("wikidata", __name__, template_folder="templates")
 
 def get_wikidata_id(property_id: str, value: str, retries: int = 3, backoff: float = 1.0) -> Optional[str]:
     """

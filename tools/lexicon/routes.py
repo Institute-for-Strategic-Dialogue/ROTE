@@ -335,7 +335,7 @@ def cum_counts(series_of_lists: pd.Series) -> pd.Series:
     flat = sum(series_of_lists.tolist(), [])
     return pd.Series(flat).value_counts()
 
-lexicon_bp = Blueprint("lexicon", __name__, template_folder="templates", url_prefix="/lexicon")
+lexicon_bp = Blueprint("lexicon", __name__, template_folder="templates")
 
 
 def _load_dataframe_from_upload(file_storage, sheet_name: Optional[str] = None) -> pd.DataFrame:

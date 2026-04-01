@@ -16,3 +16,10 @@ lxml
 sentence_transformers
 Pillow
 ImageHash
+pydantic
+pyparsing
+python-louvain
+scipy
+scikit-learn
+anthropic
+voyageai

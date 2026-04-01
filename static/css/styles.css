@@ -109,6 +109,9 @@ body { font-family: "Inter", sans-serif; }
 .bg-tool-slate {
   background: linear-gradient(135deg, #334155 0%, #64748b 100%);
 }
+.bg-tool-rose {
+  background: linear-gradient(135deg, #9f1239 0%, #fb7185 100%);
+}
 
 /* Accessibility: focus ring for keyboard users on stretched links */
 a.stretched-link:focus-visible {
