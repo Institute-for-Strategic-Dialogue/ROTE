@@ -1,20 +1,22 @@
 # File: text_cluster.py
 import csv
 import io
+from collections import defaultdict
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
 from flask import Blueprint, render_template, request, send_file
 from sentence_transformers import SentenceTransformer
+from sklearn.cluster import MiniBatchKMeans
 
 text_cluster_bp = Blueprint("text_cluster", __name__, template_folder="templates")
 
 # Load once to keep responses fast; the MiniLM model is lightweight yet strong.
 _MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-# Hard guardrails to keep latency reasonable
-MAX_DOCS = 5000
+# Hard guardrails
+MAX_DOCS = 500_000
 DEFAULT_THRESHOLD = 0.8
 DEFAULT_MIN_CLUSTER_SIZE = 2
 
@@ -35,9 +37,11 @@ def _normalize_min_cluster_size(raw: str | None) -> int:
     return max(1, min(MAX_DOCS, val))
 
 
-def _read_rows_from_upload(upload) -> tuple[list[str], list[dict], list[str], list[int]]:
+def _read_rows_from_upload(upload, text_column: str | None = None) -> tuple[list[str], list[dict], list[str], list[int]]:
     """
-    Accept .txt (one per line) or .csv (uses 'text' column if present, otherwise first column).
+    Accept .txt (one per line) or .csv.
+    *text_column* lets the caller pick which CSV column to cluster on.
+    Falls back to a column named 'text', then the first column.
     """
     if not upload:
         return [], [], [], []
@@ -60,8 +64,12 @@ def _read_rows_from_upload(upload) -> tuple[list[str], list[dict], list[str], li
             reader = csv.DictReader(buf, dialect=dialect)
             rows = []
             if reader.fieldnames:
-                lowered = [c.lower() for c in reader.fieldnames]
-                text_col = reader.fieldnames[lowered.index("text")] if "text" in lowered else reader.fieldnames[0]
+                # Resolve which column holds the text to cluster
+                if text_column and text_column in reader.fieldnames:
+                    text_col = text_column
+                else:
+                    lowered = [c.lower() for c in reader.fieldnames]
+                    text_col = reader.fieldnames[lowered.index("text")] if "text" in lowered else reader.fieldnames[0]
                 buf.seek(0)
                 reader = csv.DictReader(buf, dialect=dialect)
                 for row in reader:
@@ -95,36 +103,39 @@ def _read_rows_from_form(text_blob: str | None) -> tuple[list[str], list[dict], 
     return lines, rows, ["text"], list(range(len(rows)))
 
 
-def _cluster_texts(
-    texts: Iterable[str], threshold: float, min_cluster_size: int
-) -> tuple[list[dict], list[dict]]:
-    texts = [t.strip() for t in texts if t and t.strip()]
-    if not texts:
-        return [], []
-    texts = texts[:MAX_DOCS]
-
-    embeddings = _MODEL.encode(
+def _encode(texts: list[str]) -> np.ndarray:
+    return _MODEL.encode(
         texts,
-        batch_size=64,
+        batch_size=256,
         show_progress_bar=False,
         normalize_embeddings=True,
         convert_to_numpy=True,
     )
 
-    # Cosine similarity via dot product of normalized embeddings
-    sim_matrix = np.matmul(embeddings, embeddings.T)
 
-    visited = set()
+# ---------------------------------------------------------------------------
+# Mode 1 – Near-duplicate detection  (greedy cosine-threshold clustering)
+# ---------------------------------------------------------------------------
+
+def _cluster_neardup(
+    texts: list[str], embeddings: np.ndarray, threshold: float, min_cluster_size: int
+) -> tuple[list[dict], list[dict]]:
+    n = len(texts)
+
+    # Greedy clustering without an n×n matrix.
+    # For each unvisited seed, compute its cosine similarity to every text
+    # via a single vector-matrix multiply (O(n·d) per seed, O(n·d) memory).
+    visited = np.zeros(n, dtype=bool)
     clusters = []
-    for i in range(len(texts)):
-        if i in visited:
+    for i in range(n):
+        if visited[i]:
             continue
-        mask = sim_matrix[i] >= threshold
-        indices = [idx for idx, ok in enumerate(mask) if ok and idx not in visited]
-        for idx in indices:
-            visited.add(idx)
+        sims = embeddings @ embeddings[i]          # (n,) cosine similarities
+        mask = (sims >= threshold) & ~visited
+        indices = np.where(mask)[0]
+        visited[indices] = True
         members = [
-            {"text": texts[idx], "similarity": float(sim_matrix[i, idx])}
+            {"text": texts[idx], "similarity": float(sims[idx])}
             for idx in indices
         ]
         clusters.append(
@@ -132,13 +143,13 @@ def _cluster_texts(
                 "id": None,
                 "size": len(members),
                 "members": members,
-                "indices": indices,
+                "indices": indices.tolist(),
             }
         )
 
     # Order clusters by size descending for readability
     clusters.sort(key=lambda c: c["size"], reverse=True)
-    assignments = [{"cluster_id": "", "cluster_size": 1} for _ in range(len(texts))]
+    assignments = [{"cluster_id": "", "cluster_size": 1} for _ in range(n)]
 
     next_id = 1
     for cluster in clusters:
@@ -149,6 +160,61 @@ def _cluster_texts(
             assignments[text_idx] = {
                 "cluster_id": cluster["id"] or "",
                 "cluster_size": cluster["size"],
+            }
+
+    display_clusters = [c for c in clusters if c["id"] is not None]
+    return display_clusters, assignments
+
+
+# ---------------------------------------------------------------------------
+# Mode 2 – Semantic grouping  (MiniBatchKMeans on SBERT embeddings)
+# ---------------------------------------------------------------------------
+
+def _cluster_semantic(
+    texts: list[str], embeddings: np.ndarray, n_clusters: int, min_cluster_size: int
+) -> tuple[list[dict], list[dict]]:
+    n = len(texts)
+    n_clusters = max(2, min(n_clusters, n))
+
+    kmeans = MiniBatchKMeans(
+        n_clusters=n_clusters, batch_size=max(256, n_clusters), n_init=3, random_state=42
+    )
+    labels = kmeans.fit_predict(embeddings)
+    centroids = kmeans.cluster_centers_
+    norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    centroids = centroids / norms
+
+    # Group texts by label
+    groups: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    for i, label in enumerate(labels):
+        sim = float(embeddings[i] @ centroids[label])
+        groups[int(label)].append((i, sim))
+
+    # Build output sorted by cluster size
+    sorted_labels = sorted(groups, key=lambda k: len(groups[k]), reverse=True)
+    clusters = []
+    assignments = [{"cluster_id": "", "cluster_size": 1} for _ in range(n)]
+
+    next_id = 1
+    for label in sorted_labels:
+        members_data = sorted(groups[label], key=lambda t: t[1], reverse=True)
+        size = len(members_data)
+        indices = [idx for idx, _ in members_data]
+        members = [
+            {"text": texts[idx], "similarity": sim} for idx, sim in members_data
+        ]
+        cluster_id = None
+        if size >= min_cluster_size:
+            cluster_id = next_id
+            next_id += 1
+        clusters.append(
+            {"id": cluster_id, "size": size, "members": members, "indices": indices}
+        )
+        for idx, _ in members_data:
+            assignments[idx] = {
+                "cluster_id": cluster_id or "",
+                "cluster_size": size,
             }
 
     display_clusters = [c for c in clusters if c["id"] is not None]
@@ -193,20 +259,43 @@ def text_cluster():
     min_cluster_size = DEFAULT_MIN_CLUSTER_SIZE
     total = 0
 
+    cluster_method = "neardup"
+    n_clusters_target = 0
+
     if request.method == "POST":
+        cluster_method = request.form.get("cluster_method", "neardup")
         threshold = _normalize_threshold(request.form.get("threshold"))
         min_cluster_size = _normalize_min_cluster_size(request.form.get("min_cluster_size"))
         output_mode = request.form.get("output_mode", "table")
 
+        text_column = (request.form.get("text_column") or "").strip() or None
+
         pasted = _read_rows_from_form(request.form.get("texts"))
-        uploaded = _read_rows_from_upload(request.files.get("text_file"))
+        uploaded = _read_rows_from_upload(request.files.get("text_file"), text_column=text_column)
 
         texts, rows, fieldnames, row_indices = uploaded if uploaded[0] else pasted
         if len(texts) > MAX_DOCS:
             texts = texts[:MAX_DOCS]
             row_indices = row_indices[:MAX_DOCS]
         total = len(texts)
-        clusters, assignments = _cluster_texts(texts, threshold, min_cluster_size)
+        assignments = []
+
+        if total > 0:
+            embeddings = _encode(texts)
+
+            if cluster_method == "semantic":
+                raw_k = request.form.get("n_clusters", "")
+                try:
+                    n_clusters_target = max(2, int(raw_k))
+                except (TypeError, ValueError):
+                    n_clusters_target = max(2, int(total ** 0.5))
+                clusters, assignments = _cluster_semantic(
+                    texts, embeddings, n_clusters_target, min_cluster_size
+                )
+            else:
+                clusters, assignments = _cluster_neardup(
+                    texts, embeddings, threshold, min_cluster_size
+                )
 
         if output_mode in {"csv", "excel"} and rows:
             output_rows, output_fields = _build_download_payload(
@@ -245,4 +334,6 @@ def text_cluster():
         min_cluster_size=min_cluster_size,
         total=total,
         max_docs=MAX_DOCS,
+        cluster_method=cluster_method,
+        n_clusters_target=n_clusters_target,
     )

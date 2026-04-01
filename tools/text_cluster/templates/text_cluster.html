@@ -3,7 +3,7 @@
 <div class="row mb-4">
   <div class="col-lg-8">
     <h1 class="h3 mb-2">Text Similarity Clustering</h1>
-    <p class="text-muted">Paste short texts or upload a CSV/TXT file to group semantically similar items using SBERT embeddings. Clusters are built greedily using a cosine similarity threshold.</p>
+    <p class="text-muted">Upload a CSV/TXT or paste texts to find groups of similar items using SBERT embeddings.</p>
   </div>
 </div>
 
@@ -15,20 +15,56 @@
   <div class="mb-3">
     <label class="form-label">Or upload CSV/TXT</label>
     <input class="form-control" type="file" name="text_file" accept=".csv,.txt">
-    <div class="form-text">CSV: uses the <code>text</code> column if present, otherwise the first column. Processes up to {{ max_docs }} rows.</div>
+    <div class="form-text">CSV: uses the specified column, or <code>text</code> if present, otherwise the first column. Up to {{ "{:,}".format(max_docs) }} rows.</div>
   </div>
+
+  {# --- Method selector --- #}
+  {% set method = cluster_method or "neardup" %}
+  <div class="row g-3 align-items-end mb-3">
+    <div class="col-sm-4">
+      <label class="form-label">Clustering method</label>
+      <select class="form-select" name="cluster_method" id="clusterMethod">
+        <option value="neardup" {% if method == "neardup" %}selected{% endif %}>Near-duplicate detection</option>
+        <option value="semantic" {% if method == "semantic" %}selected{% endif %}>Semantic grouping</option>
+      </select>
+    </div>
+    <div class="col-sm-8">
+      <div id="methodHelpNeardup" class="form-text mt-2" {% if method != "neardup" %}style="display:none"{% endif %}>
+        Finds texts that are nearly identical — reposts, copypasta, minor rewording. Good for deduplication. You set a similarity threshold; only texts above it are grouped together.
+      </div>
+      <div id="methodHelpSemantic" class="form-text mt-2" {% if method != "semantic" %}style="display:none"{% endif %}>
+        Groups texts by topic and meaning, even if wording differs. Good for discovering themes in a large dataset. You choose how many clusters to create (or leave blank for auto).
+      </div>
+    </div>
+  </div>
+
+  {# --- Parameters --- #}
   <div class="row g-3 align-items-end">
     <div class="col-sm-3">
+      <label class="form-label">Text column</label>
+      <input class="form-control" type="text" name="text_column" value="{{ request.form.get('text_column', '') }}" placeholder="auto-detect">
+      <div class="form-text">CSV column name to cluster on.</div>
+    </div>
+
+    {# Near-dup: threshold #}
+    <div class="col-sm-3" id="paramThreshold" {% if method == "semantic" %}style="display:none"{% endif %}>
       <label class="form-label">Similarity threshold</label>
       <input class="form-control" type="number" name="threshold" step="0.05" min="0.3" max="1.0" value="{{ '%.2f'|format(threshold) }}">
-      <div class="form-text">Higher = stricter clusters.</div>
+      <div class="form-text">Higher = stricter matches.</div>
     </div>
-    <div class="col-sm-3">
+
+    {# Semantic: target clusters #}
+    <div class="col-sm-3" id="paramNClusters" {% if method != "semantic" %}style="display:none"{% endif %}>
+      <label class="form-label">Target clusters</label>
+      <input class="form-control" type="number" name="n_clusters" min="2" step="1" value="{{ n_clusters_target if n_clusters_target else '' }}" placeholder="auto">
+      <div class="form-text">Leave blank for auto (sqrt of n).</div>
+    </div>
+
+    <div class="col-sm-2">
       <label class="form-label">Min cluster size</label>
       <input class="form-control" type="number" name="min_cluster_size" min="1" step="1" value="{{ min_cluster_size }}">
-      <div class="form-text">Clusters smaller than this are left unassigned.</div>
     </div>
-    <div class="col-sm-3">
+    <div class="col-sm-2">
       <label class="form-label">Output</label>
       <select class="form-select" name="output_mode">
         {% set mode = request.form.get("output_mode", "table") %}
@@ -36,10 +72,9 @@
         <option value="csv" {% if mode == "csv" %}selected{% endif %}>Download CSV</option>
         <option value="excel" {% if mode == "excel" %}selected{% endif %}>Download Excel</option>
       </select>
-      <div class="form-text">Downloads include original columns + cluster_id, cluster_size.</div>
     </div>
-    <div class="col-sm-3">
-      <button class="btn btn-primary" type="submit">Cluster texts</button>
+    <div class="col-sm-2">
+      <button class="btn btn-primary w-100" type="submit">Cluster</button>
     </div>
   </div>
 </form>
@@ -48,7 +83,10 @@
   <div class="mb-3">
     <div class="d-flex justify-content-between">
       <div><strong>{{ clusters|length }}</strong> clusters from <strong>{{ total }}</strong> texts.</div>
-      <div class="text-muted">Sorted by size; similarity shown vs the cluster seed.</div>
+      <div class="text-muted">
+        Sorted by size; similarity shown vs
+        {% if cluster_method == "semantic" %}cluster centroid{% else %}cluster seed{% endif %}.
+      </div>
     </div>
   </div>
   {% for cluster in clusters %}
@@ -58,7 +96,7 @@
         <span class="badge bg-secondary">{{ cluster.size }} item{{ 's' if cluster.size != 1 else '' }}</span>
       </div>
       <ul class="list-group list-group-flush">
-        {% for item in cluster.members %}
+        {% for item in cluster.members[:50] %}
           <li class="list-group-item">
             <div class="d-flex justify-content-between">
               <div>{{ item.text }}</div>
@@ -66,10 +104,23 @@
             </div>
           </li>
         {% endfor %}
+        {% if cluster.members|length > 50 %}
+          <li class="list-group-item text-muted">... and {{ cluster.members|length - 50 }} more (download CSV/Excel for full list)</li>
+        {% endif %}
       </ul>
     </div>
   {% endfor %}
 {% elif request.method == "POST" %}
   <div class="alert alert-warning">No texts were provided.</div>
 {% endif %}
+
+<script>
+document.getElementById('clusterMethod').addEventListener('change', function() {
+  var isSemantic = this.value === 'semantic';
+  document.getElementById('paramThreshold').style.display  = isSemantic ? 'none' : '';
+  document.getElementById('paramNClusters').style.display   = isSemantic ? '' : 'none';
+  document.getElementById('methodHelpNeardup').style.display  = isSemantic ? 'none' : '';
+  document.getElementById('methodHelpSemantic').style.display = isSemantic ? '' : 'none';
+});
+</script>
 {% endblock %}
