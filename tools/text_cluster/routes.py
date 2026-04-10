@@ -49,7 +49,9 @@ def _read_rows_from_upload(upload, text_column: str | None = None) -> tuple[list
     filename = (getattr(upload, "filename", "") or "").lower()
     raw = upload.read()
     if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", errors="ignore")
+        # utf-8-sig strips a leading BOM so the first column name doesn't end up
+        # as '\ufeff<col>' and silently break exact-match column lookups.
+        raw = raw.decode("utf-8-sig", errors="ignore")
 
     if filename.endswith(".csv"):
         buf = io.StringIO(raw, newline="")  # newline='' avoids csv new-line errors
