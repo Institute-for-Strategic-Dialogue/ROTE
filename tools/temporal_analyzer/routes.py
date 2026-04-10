@@ -56,28 +56,185 @@ def _parse_unix(series: pd.Series) -> Optional[pd.Series]:
     return None
 
 def _parse_datetimes(raw: pd.Series, dayfirst: bool) -> Optional[pd.Series]:
-    try:
-        dt = pd.to_datetime(raw, infer_datetime_format=True, utc=True, errors="coerce")
-        if dt.notna().mean() > 0.8:
-            return dt
-    except Exception:
-        pass
-    try:
-        dt = pd.to_datetime(raw, infer_datetime_format=True, utc=True, errors="coerce", dayfirst=dayfirst)
-        if dt.notna().mean() > 0.8:
-            return dt
-    except Exception:
-        pass
+    """
+    Try several parsing strategies and return whichever yields the most parsed rows.
+    Only rejects columns where *nothing* parses — sparse columns (e.g. a reply-date
+    field populated on only 30% of rows) are still accepted.
+    """
+    non_null = raw.notna().sum()
+    if non_null == 0:
+        return None
+
+    best: Optional[pd.Series] = None
+    best_count = 0
+
+    strategies = [
+        dict(utc=True, errors="coerce"),
+        dict(utc=True, errors="coerce", dayfirst=dayfirst),
+        dict(utc=True, errors="coerce", format="mixed"),
+        dict(utc=True, errors="coerce", format="ISO8601"),
+    ]
+    for kw in strategies:
+        try:
+            dt = pd.to_datetime(raw, **kw)
+        except Exception:
+            continue
+        parsed = dt.notna().sum()
+        if parsed > best_count:
+            best, best_count = dt, parsed
+
     dt_unix = _parse_unix(raw)
-    if dt_unix is not None and dt_unix.notna().mean() > 0.8:
-        return dt_unix
+    if dt_unix is not None:
+        parsed = dt_unix.notna().sum()
+        if parsed > best_count:
+            best, best_count = dt_unix, parsed
+
+    # Accept if we parsed at least 20% of non-null values (or 10 rows, whichever is lower).
+    threshold = max(1, min(10, int(non_null * 0.2)))
+    if best is not None and best_count >= threshold:
+        return best
     return None
 
+
+# Word-boundary regex so "Sentiment" no longer matches via its substring "time".
+_DATETIME_COL_RE = re.compile(
+    r"(?:^|[_\W])(time|date|timestamp|created|posted|published|updated|added)(?:$|[_\W])",
+    re.I,
+)
+
 def _auto_pick_datetime_column(df: pd.DataFrame) -> Optional[str]:
-    candidates = [c for c in df.columns if re.search(r"(time|date|timestamp|created|posted|published)", str(c), re.I)]
+    # Prefer columns whose name matches a datetime keyword at a word boundary,
+    # ranked by how many values we can actually parse.
+    candidates = [c for c in df.columns if _DATETIME_COL_RE.search(str(c))]
+    best_col, best_count = None, 0
     for c in candidates:
-        return c
-    return df.columns[0] if len(df.columns) else None
+        parsed = _parse_datetimes(df[c], dayfirst=False)
+        count = int(parsed.notna().sum()) if parsed is not None else 0
+        if count > best_count:
+            best_col, best_count = c, count
+    if best_col:
+        return best_col
+    # Fallback: scan every column and take whichever parses the most values.
+    for c in df.columns:
+        parsed = _parse_datetimes(df[c], dayfirst=False)
+        count = int(parsed.notna().sum()) if parsed is not None else 0
+        if count > best_count:
+            best_col, best_count = c, count
+    return best_col or (df.columns[0] if len(df.columns) else None)
+
+
+# ----------------------------
+# Flexible column detection & tokenization (URLs, hashtags, text)
+# ----------------------------
+_URL_COL_RE = re.compile(
+    r"(?:^|[_\W])(url|urls|link|links|href|expanded[_\s]?urls?|short[_\s]?urls?)(?:$|[_\W])",
+    re.I,
+)
+_HASHTAG_COL_RE = re.compile(
+    r"(?:^|[_\W])(hashtag|hashtags|tag|tags)(?:$|[_\W])", re.I,
+)
+_TEXT_COL_RE = re.compile(
+    r"(?:^|[_\W])(text|body|message|content|caption|full[_\s]?text|post|title)(?:$|[_\W])",
+    re.I,
+)
+
+_URL_EXTRACT_RE = re.compile(r"https?://[^\s,;\"'<>\]\[|]+", re.I)
+_HASHTAG_EXTRACT_RE = re.compile(r"#[\w\u00C0-\uFFFF]+")
+
+
+def _pick_column(
+    df: pd.DataFrame,
+    requested: Optional[str],
+    pattern: Optional[re.Pattern],
+    preferred_names: Optional[list[str]] = None,
+) -> Optional[str]:
+    """
+    Return *requested* if present; else try exact matches against *preferred_names*
+    (case/space/underscore insensitive); else first non-empty column matching *pattern*.
+    """
+    if requested and requested in df.columns:
+        return requested
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[\s_\-]+", "", s.strip().lower())
+
+    if preferred_names:
+        normed = {_norm(c): c for c in df.columns}
+        for name in preferred_names:
+            hit = normed.get(_norm(name))
+            if hit and df[hit].notna().any():
+                return hit
+
+    if pattern is not None:
+        for c in df.columns:
+            if pattern.search(str(c)) and df[c].notna().any():
+                return c
+    return None
+
+
+def _tokenize_urls(cell) -> list[str]:
+    """Extract URL tokens from arbitrary cell content — single URL, CSV list, JSON, Brandwatch style, etc."""
+    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+        return []
+    s = str(cell).strip()
+    if not s or s.lower() in ("nan", "none", "null", "[]", "{}"):
+        return []
+    out: list[str] = []
+    for u in _URL_EXTRACT_RE.findall(s):
+        u = u.rstrip('.,;)"\'>]}')
+        if u:
+            out.append(u)
+    return out
+
+
+def _tokenize_hashtags(cell, strict: bool = True) -> list[str]:
+    """
+    Extract hashtag tokens from arbitrary cell content.
+
+    - Any literal `#tag` is always collected.
+    - When *strict* is True (text columns), anything lacking a `#` is ignored —
+      we never invent hashtags from free prose.
+    - When *strict* is False (explicit hashtag columns like Brandwatch's "Hashtags"),
+      a short comma/semicolon-separated list of bare tag tokens is also accepted,
+      but only if the whole cell looks tag-like (no multi-word phrases, short tokens,
+      small count).
+    """
+    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+        return []
+    s = str(cell).strip()
+    if not s or s.lower() in ("nan", "none", "null", "[]"):
+        return []
+    tags = _HASHTAG_EXTRACT_RE.findall(s)
+    if tags:
+        return [t.lower() for t in tags]
+    if strict:
+        return []
+    # Permissive fallback for dedicated hashtag columns.
+    parts = [p.strip().lstrip("#") for p in re.split(r"[,;\n]+", s)]
+    parts = [p for p in parts if p]
+    if not parts or len(parts) > 30:
+        return []
+    if not all(re.match(r"^\w{2,30}$", p) for p in parts):
+        return []
+    return ["#" + p.lower() for p in parts]
+
+
+def _explode_tokens(df_work: pd.DataFrame, source: Optional[pd.Series], tokenizer, col_name: str) -> pd.DataFrame:
+    """
+    Expand each event into (ts, entity, token) rows by applying *tokenizer* to the
+    aligned value in *source*. Aligns on df_work's original index.
+    """
+    if source is None or df_work.empty:
+        return pd.DataFrame(columns=list(df_work.columns) + [col_name])
+    aligned = source.reindex(df_work.index)
+    tokens = aligned.apply(tokenizer)
+    base = df_work.copy()
+    base[col_name] = tokens
+    base = base[base[col_name].map(lambda x: isinstance(x, list) and len(x) > 0)]
+    if base.empty:
+        return pd.DataFrame(columns=list(df_work.columns) + [col_name])
+    return base.explode(col_name, ignore_index=True).dropna(subset=[col_name, "ts"])
+
 
 def _ensure_timezone(dt: pd.Series, tz_name: Optional[str]) -> pd.Series:
     if tz_name:
@@ -248,10 +405,10 @@ def _compute_coordination_indicators(ts: pd.Series, by_minute: pd.DataFrame) -> 
     pct_min_mult_5 = float(((minute % 5) == 0).sum()) / total if total else 0.0
     pct_min_quarter = float(minute.isin([0, 15, 30, 45]).sum()) / total if total else 0.0
 
-    dup_counts = ts.dt.floor("S").value_counts()
+    dup_counts = ts.dt.floor("s").value_counts()
     duplicate_share = float(dup_counts[dup_counts >= 2].sum()) / total if total else 0.0
 
-    per_min_series = ts.dt.floor("T").value_counts().sort_index()
+    per_min_series = ts.dt.floor("min").value_counts().sort_index()
     if len(per_min_series) > 0 and per_min_series.median() > 0:
         burst_ratio = float(per_min_series.max()) / float(per_min_series.median())
     else:
@@ -327,7 +484,7 @@ def _entity_near_simultaneity_and_jitter(
                 0, np.nan, np.nan, 0, 0)
 
     # Bin to near-simultaneity window
-    bin_freq = f"{int(co_window_seconds)}S"
+    bin_freq = f"{int(co_window_seconds)}s"
     df_work = df_work.copy()
     df_work["bin"] = df_work["ts"].dt.floor(bin_freq)
 
@@ -340,7 +497,7 @@ def _entity_near_simultaneity_and_jitter(
     win_multi = win[win["unique_entities"] >= 2].copy()
     if not win_multi.empty:
         win_multi["window_start"] = win_multi["bin"]
-        win_multi["window_end"] = win_multi["bin"] + pd.to_datetime(pd.Timedelta(seconds=co_window_seconds - 1))
+        win_multi["window_end"] = win_multi["bin"] + pd.Timedelta(seconds=co_window_seconds - 1)
         win_multi["entities"] = win_multi["entities"].apply(
             lambda lst: ", ".join(map(str, lst[:20])) + (" …" if len(lst) > 20 else "")
         )
@@ -445,6 +602,178 @@ def _entity_near_simultaneity_and_jitter(
             entities_with_repetition, entities_total)
 
 
+# ----------------------------
+# CIB features
+# ----------------------------
+
+def _analyze_amplification(
+    exploded: pd.DataFrame,
+    token_col: str,
+    window_seconds: int,
+    min_entities: int,
+) -> pd.DataFrame:
+    """
+    Flag tokens (URLs, hashtags, …) shared by ≥min_entities distinct entities inside one
+    time bin of window_seconds.
+    """
+    if exploded is None or exploded.empty or "entity" not in exploded.columns:
+        return pd.DataFrame()
+    df = exploded.copy()
+    df["bin"] = df["ts"].dt.floor(f"{int(window_seconds)}s")
+    grp = df.groupby([token_col, "bin"]).agg(
+        distinct_entities=("entity", "nunique"),
+        total_shares=("entity", "size"),
+        first_ts=("ts", "min"),
+        last_ts=("ts", "max"),
+        entities_list=("entity", lambda x: list(pd.unique(x))),
+    ).reset_index()
+    grp = grp[grp["distinct_entities"] >= int(min_entities)].copy()
+    cols = [token_col, "window_start", "first_ts", "last_ts", "distinct_entities", "total_shares", "entities"]
+    if grp.empty:
+        return pd.DataFrame(columns=cols)
+    grp = grp.rename(columns={"bin": "window_start"})
+    grp["entities"] = grp["entities_list"].apply(
+        lambda lst: ", ".join(map(str, lst[:20])) + (" …" if len(lst) > 20 else "")
+    )
+    grp = grp.drop(columns=["entities_list"])
+    return grp[cols].sort_values(
+        ["distinct_entities", "total_shares"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+
+def _analyze_entity_hour_profile(df_work: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-entity hour-of-day distribution with Shannon entropy. Flags "always-on" accounts
+    (broad, high-entropy 24/7 activity) and narrow accounts (≤4 hours of activity).
+    """
+    if df_work.empty or "entity" not in df_work.columns:
+        return pd.DataFrame()
+    df = df_work.copy()
+    df["hour"] = df["ts"].dt.hour.astype(int)
+    log2_24 = math.log2(24)
+    rows = []
+    for ent, grp in df.groupby("entity"):
+        counts = np.bincount(grp["hour"].to_numpy(), minlength=24)[:24]
+        n = int(counts.sum())
+        if n == 0:
+            continue
+        e_bits = _entropy_bits(counts.astype(float))
+        e_norm = e_bits / log2_24
+        active_hours = int((counts > 0).sum())
+        top_hour = int(counts.argmax())
+        top_hour_share = float(counts.max() / n)
+        rows.append({
+            "entity": ent,
+            "n_events": n,
+            "active_hours_of_24": active_hours,
+            "top_hour": top_hour,
+            "top_hour_share": top_hour_share,
+            "hour_entropy_bits": e_bits,
+            "hour_entropy_normalized": e_norm,
+            "always_on_flag": bool(active_hours >= 22 and e_norm >= 0.90 and n >= 20),
+            "narrow_hours_flag": bool(active_hours <= 4 and n >= 10),
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(
+        ["always_on_flag", "hour_entropy_normalized", "n_events"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+
+def _analyze_burst_correlation(
+    df_work: pd.DataFrame,
+    top_n: int = 50,
+    min_correlation: float = 0.5,
+    min_events_per_entity: int = 10,
+) -> pd.DataFrame:
+    """
+    Pearson correlation of per-minute posting counts across the top-N most active entities.
+    Gated on activity to keep the O(N²) comparison tractable.
+    """
+    if df_work.empty or "entity" not in df_work.columns:
+        return pd.DataFrame()
+    df = df_work.copy()
+    df["minute"] = df["ts"].dt.floor("min")
+    ent_counts = df["entity"].value_counts()
+    ent_counts = ent_counts[ent_counts >= int(min_events_per_entity)].head(int(top_n))
+    if len(ent_counts) < 2:
+        return pd.DataFrame(columns=["entity_a", "entity_b", "pearson_r", "events_a", "events_b"])
+    top_entities = ent_counts.index.tolist()
+    df = df[df["entity"].isin(top_entities)]
+    pivot = (
+        df.groupby(["minute", "entity"]).size()
+        .unstack("entity", fill_value=0)
+        .sort_index()
+    )
+    if pivot.shape[0] < 3 or pivot.shape[1] < 2:
+        return pd.DataFrame(columns=["entity_a", "entity_b", "pearson_r", "events_a", "events_b"])
+    corr = pivot.corr(method="pearson")
+    rows = []
+    entities = list(corr.columns)
+    for i in range(len(entities)):
+        for j in range(i + 1, len(entities)):
+            a, b = entities[i], entities[j]
+            c = corr.iat[i, j]
+            if pd.isna(c) or c < float(min_correlation):
+                continue
+            rows.append({
+                "entity_a": a,
+                "entity_b": b,
+                "pearson_r": float(c),
+                "events_a": int(ent_counts[a]),
+                "events_b": int(ent_counts[b]),
+            })
+    if not rows:
+        return pd.DataFrame(columns=["entity_a", "entity_b", "pearson_r", "events_a", "events_b"])
+    return pd.DataFrame(rows).sort_values("pearson_r", ascending=False).reset_index(drop=True)
+
+
+def _analyze_dormancy_bursts(
+    df_work: pd.DataFrame,
+    dormancy_days: float = 30,
+    burst_hours: float = 24,
+    min_burst_events: int = 5,
+) -> pd.DataFrame:
+    """
+    Entities that went silent for ≥dormancy_days then posted ≥min_burst_events within burst_hours
+    of reactivation. Classic "dormant sleeper cell" reactivation pattern.
+    """
+    if df_work.empty or "entity" not in df_work.columns:
+        return pd.DataFrame()
+    dormancy_td = pd.Timedelta(days=float(dormancy_days))
+    burst_td = pd.Timedelta(hours=float(burst_hours))
+    min_events = int(min_burst_events)
+    rows = []
+    for ent, grp in df_work.sort_values("ts").groupby("entity"):
+        ts_series = grp["ts"].reset_index(drop=True)
+        if len(ts_series) < min_events + 1:
+            continue
+        gaps = ts_series.diff()
+        for i in range(1, len(ts_series)):
+            gap = gaps.iloc[i]
+            if pd.notna(gap) and gap >= dormancy_td:
+                reactivation = ts_series.iloc[i]
+                burst_end = reactivation + burst_td
+                n_in_burst = int(((ts_series >= reactivation) & (ts_series <= burst_end)).sum())
+                if n_in_burst >= min_events:
+                    rows.append({
+                        "entity": ent,
+                        "dormancy_days": float(gap.total_seconds() / 86400),
+                        "reactivation_ts": reactivation,
+                        "burst_end_ts": burst_end,
+                        "events_in_burst": n_in_burst,
+                        "total_events": int(len(ts_series)),
+                    })
+                    break  # report first qualifying reactivation per entity
+    cols = ["entity", "dormancy_days", "reactivation_ts", "burst_end_ts", "events_in_burst", "total_events"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows)[cols].sort_values(
+        ["events_in_burst", "dormancy_days"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+
 # ------- REFACTORED: main orchestrator -------
 
 def analyze_temporal(
@@ -454,6 +783,17 @@ def analyze_temporal(
     dayfirst: bool,
     entity_col: Optional[str] = None,
     co_window_seconds: int = 10,
+    url_col: Optional[str] = None,
+    hashtag_col: Optional[str] = None,
+    text_col: Optional[str] = None,
+    amp_window_seconds: int = 300,
+    min_amp_entities: int = 3,
+    dormancy_days: float = 30,
+    burst_hours: float = 24,
+    min_burst_events: int = 5,
+    corr_top_n: int = 50,
+    corr_min: float = 0.5,
+    corr_min_events_per_entity: int = 10,
 ):
     """
     End-to-end temporal analysis.
@@ -493,6 +833,50 @@ def analyze_temporal(
      windows_copost_n, share_events_in_copost_windows, top_pair_coposts,
      entities_with_repetition, entities_total) = _entity_near_simultaneity_and_jitter(df_work, co_window_seconds)
 
+    # 5b) CIB features (all entity-gated)
+    url_amplification = pd.DataFrame()
+    hashtag_storms = pd.DataFrame()
+    entity_hour_profile = pd.DataFrame()
+    burst_correlation = pd.DataFrame()
+    dormancy_bursts = pd.DataFrame()
+
+    if entity_mode:
+        # URL amplification
+        if url_col and url_col in df.columns:
+            url_exploded = _explode_tokens(df_work, df[url_col], _tokenize_urls, "url")
+            url_amplification = _analyze_amplification(
+                url_exploded, "url", amp_window_seconds, min_amp_entities,
+            )
+
+        # Hashtag storms: prefer hashtag column (permissive tokenizer for bare tag lists);
+        # fall back to text column using the strict tokenizer (only literal #tags).
+        hashtag_source = None
+        hashtag_tokenizer = lambda c: _tokenize_hashtags(c, strict=True)
+        if hashtag_col and hashtag_col in df.columns:
+            hashtag_source = df[hashtag_col]
+            hashtag_tokenizer = lambda c: _tokenize_hashtags(c, strict=False)
+        elif text_col and text_col in df.columns:
+            hashtag_source = df[text_col]
+        if hashtag_source is not None:
+            tag_exploded = _explode_tokens(df_work, hashtag_source, hashtag_tokenizer, "hashtag")
+            hashtag_storms = _analyze_amplification(
+                tag_exploded, "hashtag", amp_window_seconds, min_amp_entities,
+            )
+
+        entity_hour_profile = _analyze_entity_hour_profile(df_work)
+        burst_correlation = _analyze_burst_correlation(
+            df_work,
+            top_n=corr_top_n,
+            min_correlation=corr_min,
+            min_events_per_entity=corr_min_events_per_entity,
+        )
+        dormancy_bursts = _analyze_dormancy_bursts(
+            df_work,
+            dormancy_days=dormancy_days,
+            burst_hours=burst_hours,
+            min_burst_events=min_burst_events,
+        )
+
     # 6) Indicator table (single-row summary)
     indicators = pd.DataFrame([{
         "total_events": ci["total"],
@@ -524,6 +908,15 @@ def analyze_temporal(
         "entities_with_repetition_flag": entities_with_repetition,
         "entities_total": entities_total,
         "entities_repetition_share": (entities_with_repetition / entities_total) if entities_total else np.nan,
+        # CIB feature summaries
+        "amp_window_seconds": int(amp_window_seconds),
+        "min_amp_entities": int(min_amp_entities),
+        "url_amplified_rows": int(len(url_amplification)),
+        "hashtag_storm_rows": int(len(hashtag_storms)),
+        "entities_always_on": int(entity_hour_profile["always_on_flag"].sum()) if not entity_hour_profile.empty else 0,
+        "entities_narrow_hours": int(entity_hour_profile["narrow_hours_flag"].sum()) if not entity_hour_profile.empty else 0,
+        "burst_correlated_pairs": int(len(burst_correlation)),
+        "dormancy_burst_entities": int(len(dormancy_bursts)),
     }])
 
     # 7) Compile return payload
@@ -539,6 +932,11 @@ def analyze_temporal(
         "PAIRWISE_COPOSTS": pairwise_coposts,
         "ENTITY_SYNCHRONY": entity_synchrony,
         "ENTITY_JITTER": entity_jitter,
+        "URL_AMPLIFICATION": url_amplification,
+        "HASHTAG_STORMS": hashtag_storms,
+        "ENTITY_HOUR_PROFILE": entity_hour_profile,
+        "BURST_CORRELATION": burst_correlation,
+        "DORMANCY_BURSTS": dormancy_bursts,
         "_preview": {
             "total": int(indicators.loc[0, "total_events"]),
             "start": str(indicators.loc[0, "start"]),
@@ -561,19 +959,54 @@ def temporal():
         tz_name = request.form.get("timezone") or None
         dayfirst = bool(request.form.get("dayfirst"))
         entity_col = (request.form.get("entity_col") or "").strip() or None
-        try:
-            co_window_seconds = int(request.form.get("co_window_seconds") or 10)  # NEW
-        except Exception:
-            co_window_seconds = 10
+        url_col_req = (request.form.get("url_col") or "").strip() or None
+        hashtag_col_req = (request.form.get("hashtag_col") or "").strip() or None
+        text_col_req = (request.form.get("text_col") or "").strip() or None
 
-        file = request.files.get("csv_file")
-        if not file:
+        def _int_form(name: str, default: int) -> int:
+            try:
+                return int(request.form.get(name) or default)
+            except Exception:
+                return default
+
+        def _float_form(name: str, default: float) -> float:
+            try:
+                return float(request.form.get(name) or default)
+            except Exception:
+                return default
+
+        co_window_seconds = _int_form("co_window_seconds", 10)
+        amp_window_seconds = _int_form("amp_window_seconds", 300)
+        min_amp_entities = _int_form("min_amp_entities", 3)
+        dormancy_days = _float_form("dormancy_days", 30)
+        burst_hours = _float_form("burst_hours", 24)
+        min_burst_events = _int_form("min_burst_events", 5)
+        corr_top_n = _int_form("corr_top_n", 50)
+        corr_min = _float_form("corr_min", 0.5)
+
+        files = [f for f in request.files.getlist("csv_file") if f and f.filename]
+        if not files:
             return render_template("temporal_analyzer.html", results={"error": "Please upload a CSV file."})
 
+        frames = []
+        for f in files:
+            try:
+                part = pd.read_csv(f)
+            except Exception as e:
+                return render_template(
+                    "temporal_analyzer.html",
+                    results={"error": f"CSV '{f.filename}' could not be read: {e}"},
+                )
+            if len(files) > 1:
+                part["source_file"] = f.filename
+            frames.append(part)
         try:
-            df = pd.read_csv(file)
+            df = pd.concat(frames, ignore_index=True, sort=False)
         except Exception as e:
-            return render_template("temporal_analyzer.html", results={"error": f"CSV could not be read: {e}"})
+            return render_template(
+                "temporal_analyzer.html",
+                results={"error": f"Files could not be combined: {e}"},
+            )
 
         dt_col = (request.form.get("datetime_col") or "").strip()
         if not dt_col or dt_col not in df.columns:
@@ -582,11 +1015,35 @@ def temporal():
         if not dt_col:
             return render_template("temporal_analyzer.html", results={"error": "Could not determine a datetime column. Please specify one."})
 
+        # Auto-detect URL / hashtag / text columns when the user didn't specify them.
+        url_col = _pick_column(
+            df, url_col_req, _URL_COL_RE,
+            preferred_names=["expanded urls", "urls", "url", "link", "links"],
+        )
+        hashtag_col = _pick_column(
+            df, hashtag_col_req, _HASHTAG_COL_RE,
+            preferred_names=["hashtags", "hashtag", "tags"],
+        )
+        text_col = _pick_column(
+            df, text_col_req, _TEXT_COL_RE,
+            preferred_names=["full text", "text", "body", "message", "content", "caption"],
+        )
+
         try:
             out = analyze_temporal(
                 df, dt_col, tz_name, dayfirst,
                 entity_col=entity_col,
                 co_window_seconds=co_window_seconds,
+                url_col=url_col,
+                hashtag_col=hashtag_col,
+                text_col=text_col,
+                amp_window_seconds=amp_window_seconds,
+                min_amp_entities=min_amp_entities,
+                dormancy_days=dormancy_days,
+                burst_hours=burst_hours,
+                min_burst_events=min_burst_events,
+                corr_top_n=corr_top_n,
+                corr_min=corr_min,
             )
         except Exception as e:
             return render_template("temporal_analyzer.html", results={"error": f"Analysis failed: {e}"})
@@ -598,6 +1055,9 @@ def temporal():
                 summary = pd.DataFrame([{
                     "datetime_column": dt_col,
                     "entity_column": entity_col or "(none)",
+                    "url_column": url_col or "(none)",
+                    "hashtag_column": hashtag_col or "(none)",
+                    "text_column": text_col or "(none)",
                     "co_window_seconds": co_window_seconds,
                     "timezone": tz_name or "UTC (as-parsed)",
                     **out["INDICATORS"].iloc[0].to_dict()
@@ -627,6 +1087,13 @@ def temporal():
                 _excel_safe(out["ENTITY_SYNCHRONY"]).to_excel(writer, sheet_name="ENTITY_SYNCHRONY", index=False)
                 _excel_safe(out["ENTITY_JITTER"]).to_excel(writer, sheet_name="ENTITY_JITTER", index=False)
 
+                # CIB features
+                _excel_safe(out["URL_AMPLIFICATION"]).to_excel(writer, sheet_name="URL_AMPLIFICATION", index=False)
+                _excel_safe(out["HASHTAG_STORMS"]).to_excel(writer, sheet_name="HASHTAG_STORMS", index=False)
+                _excel_safe(out["ENTITY_HOUR_PROFILE"]).to_excel(writer, sheet_name="ENTITY_HOUR_PROFILE", index=False)
+                _excel_safe(out["BURST_CORRELATION"]).to_excel(writer, sheet_name="BURST_CORRELATION", index=False)
+                _excel_safe(out["DORMANCY_BURSTS"]).to_excel(writer, sheet_name="DORMANCY_BURSTS", index=False)
+
             output.seek(0)
             return send_file(
                 output,
@@ -647,12 +1114,28 @@ def temporal():
         jitter_preview = out["ENTITY_JITTER"][out["ENTITY_JITTER"]["repetition_flag"]].head(10).to_dict(orient="records") if not out["ENTITY_JITTER"].empty else []
         copost_pair_preview = out["PAIRWISE_COPOSTS"].head(10).to_dict(orient="records") if not out["PAIRWISE_COPOSTS"].empty else []
 
+        url_amp_preview = out["URL_AMPLIFICATION"].head(10).to_dict(orient="records") if not out["URL_AMPLIFICATION"].empty else []
+        hashtag_storm_preview = out["HASHTAG_STORMS"].head(10).to_dict(orient="records") if not out["HASHTAG_STORMS"].empty else []
+        burst_corr_preview = out["BURST_CORRELATION"].head(10).to_dict(orient="records") if not out["BURST_CORRELATION"].empty else []
+        dormancy_preview = out["DORMANCY_BURSTS"].head(10).to_dict(orient="records") if not out["DORMANCY_BURSTS"].empty else []
+        hour_profile_preview = (
+            out["ENTITY_HOUR_PROFILE"][out["ENTITY_HOUR_PROFILE"]["always_on_flag"] | out["ENTITY_HOUR_PROFILE"]["narrow_hours_flag"]]
+            .head(10).to_dict(orient="records")
+            if not out["ENTITY_HOUR_PROFILE"].empty else []
+        )
+
+        ind = out["INDICATORS"].iloc[0]
+
         results = {
             "ok": True,
             "datetime_col": dt_col,
             "timezone": tz_name or "UTC (as-parsed)",
             "entity_col": entity_col or "",
+            "url_col": url_col or "",
+            "hashtag_col": hashtag_col or "",
+            "text_col": text_col or "",
             "co_window_seconds": co_window_seconds,
+            "amp_window_seconds": amp_window_seconds,
             "summary": preview,
             "top_minutes": table_top_minute,
             "top_hours": table_top_hour,
@@ -660,6 +1143,19 @@ def temporal():
             "synchrony_preview": synchrony_preview,
             "jitter_preview": jitter_preview,
             "copost_pair_preview": copost_pair_preview,
+            "url_amp_preview": url_amp_preview,
+            "hashtag_storm_preview": hashtag_storm_preview,
+            "burst_corr_preview": burst_corr_preview,
+            "dormancy_preview": dormancy_preview,
+            "hour_profile_preview": hour_profile_preview,
+            "cib_counts": {
+                "url_amplified_rows": int(ind["url_amplified_rows"]),
+                "hashtag_storm_rows": int(ind["hashtag_storm_rows"]),
+                "entities_always_on": int(ind["entities_always_on"]),
+                "entities_narrow_hours": int(ind["entities_narrow_hours"]),
+                "burst_correlated_pairs": int(ind["burst_correlated_pairs"]),
+                "dormancy_burst_entities": int(ind["dormancy_burst_entities"]),
+            },
         }
 
     return render_template("temporal_analyzer.html", results=results)

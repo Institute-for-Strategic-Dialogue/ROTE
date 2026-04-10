@@ -10,8 +10,9 @@
 
   <div class="row g-3">
     <div class="col-md-6">
-      <label class="form-label">CSV File</label>
-      <input type="file" class="form-control" name="csv_file" accept=".csv,text/csv" required>
+      <label class="form-label">CSV File(s)</label>
+      <input type="file" class="form-control" name="csv_file" accept=".csv,text/csv" multiple required>
+      <div class="form-text">Select one or more CSVs. Multiple files are concatenated; a <code>source_file</code> column is added.</div>
     </div>
     <div class="col-md-6">
       <label class="form-label">Datetime Column (optional)</label>
@@ -21,8 +22,8 @@
 
     <div class="col-md-4">
       <label class="form-label">Entity Column (optional)</label>
-      <input type="text" class="form-control" name="entity_col" placeholder="e.g., account_id, handle, channel" value="{{ request.form.entity_col or '' }}">
-      <div class="form-text">Enables near-simultaneity and jitter analyses across entities.</div>
+      <input type="text" class="form-control" name="entity_col" placeholder="e.g., account_id, handle, author" value="{{ request.form.entity_col or '' }}">
+      <div class="form-text">Enables all entity-aware CIB analyses.</div>
     </div>
     <div class="col-md-4">
       <label class="form-label">Near-Simultaneity Window (seconds)</label>
@@ -40,6 +41,60 @@
         <input class="form-check-input" type="checkbox" name="dayfirst" id="dayfirst" {% if request.form.dayfirst %}checked{% endif %}>
         <label class="form-check-label" for="dayfirst">Day-first dates (e.g., 31/05/2025)</label>
       </div>
+    </div>
+  </div>
+
+  <hr class="my-3">
+  <h6 class="text-muted">CIB Detection (entity-aware)</h6>
+  <div class="row g-3">
+    <div class="col-md-4">
+      <label class="form-label">URL Column (optional)</label>
+      <input type="text" class="form-control" name="url_col" placeholder="auto-detect (e.g. Expanded URLs)" value="{{ request.form.url_col or '' }}">
+      <div class="form-text">Handles single URLs, CSV lists, and JSON-style arrays.</div>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label">Hashtag Column (optional)</label>
+      <input type="text" class="form-control" name="hashtag_col" placeholder="auto-detect (e.g. Hashtags)" value="{{ request.form.hashtag_col or '' }}">
+      <div class="form-text">Accepts <code>#tag</code> or bare tag lists.</div>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label">Text Column (optional, fallback for hashtags)</label>
+      <input type="text" class="form-control" name="text_col" placeholder="auto-detect (e.g. Full Text)" value="{{ request.form.text_col or '' }}">
+      <div class="form-text">Used only when no hashtag column is provided; only literal <code>#tags</code> are extracted.</div>
+    </div>
+
+    <div class="col-md-3">
+      <label class="form-label">Amplification Window (seconds)</label>
+      <input type="number" class="form-control" name="amp_window_seconds" value="{{ request.form.amp_window_seconds or 300 }}" min="1" max="86400">
+      <div class="form-text">Bucket for URL & hashtag amplification.</div>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">Min Entities to Flag</label>
+      <input type="number" class="form-control" name="min_amp_entities" value="{{ request.form.min_amp_entities or 3 }}" min="2" max="1000">
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">Dormancy (days)</label>
+      <input type="number" class="form-control" name="dormancy_days" value="{{ request.form.dormancy_days or 30 }}" min="1" max="3650" step="1">
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">Reactivation Burst (hours)</label>
+      <input type="number" class="form-control" name="burst_hours" value="{{ request.form.burst_hours or 24 }}" min="1" max="720" step="1">
+    </div>
+
+    <div class="col-md-3">
+      <label class="form-label">Min Burst Events</label>
+      <input type="number" class="form-control" name="min_burst_events" value="{{ request.form.min_burst_events or 5 }}" min="2" max="1000">
+      <div class="form-text">After a dormant gap.</div>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">Correlation: Top-N Entities</label>
+      <input type="number" class="form-control" name="corr_top_n" value="{{ request.form.corr_top_n or 50 }}" min="2" max="500">
+      <div class="form-text">Compare only the most active N.</div>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">Correlation: Min r</label>
+      <input type="number" class="form-control" name="corr_min" value="{{ request.form.corr_min or 0.5 }}" min="0" max="1" step="0.05">
+      <div class="form-text">Pearson threshold for flagged pairs.</div>
     </div>
     <div class="col-md-4">
       <label class="form-label">Output</label>
@@ -145,6 +200,99 @@
           <tbody>
             {% for row in results.jitter_preview %}
             <tr><td>{{ row.entity }}</td><td>{{ row.modal_interval_s }}</td><td>{{ "%.1f"|format((row.modal_interval_share or 0)*100) }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="mt-4">
+    <h5>CIB Detection</h5>
+    <p class="mb-2">
+      Amplification window: {{ results.amp_window_seconds }}s.
+      Using URL column <code>{{ results.url_col or '—' }}</code>,
+      hashtag column <code>{{ results.hashtag_col or '—' }}</code>,
+      text column <code>{{ results.text_col or '—' }}</code>.
+    </p>
+    <ul class="mb-3">
+      <li>URL amplification windows flagged: <strong>{{ results.cib_counts.url_amplified_rows }}</strong></li>
+      <li>Hashtag storm windows flagged: <strong>{{ results.cib_counts.hashtag_storm_rows }}</strong></li>
+      <li>Burst-correlated entity pairs: <strong>{{ results.cib_counts.burst_correlated_pairs }}</strong></li>
+      <li>Always-on entities: <strong>{{ results.cib_counts.entities_always_on }}</strong> — Narrow-hours: <strong>{{ results.cib_counts.entities_narrow_hours }}</strong></li>
+      <li>Dormancy-then-burst entities: <strong>{{ results.cib_counts.dormancy_burst_entities }}</strong></li>
+    </ul>
+
+    <div class="row">
+      <div class="col-lg-6">
+        <h6>Top URL Amplification</h6>
+        <table class="table table-sm table-striped">
+          <thead><tr><th>URL</th><th>Window</th><th>Entities</th><th>Shares</th></tr></thead>
+          <tbody>
+            {% for row in results.url_amp_preview %}
+            <tr>
+              <td class="text-truncate" style="max-width: 240px;" title="{{ row.url }}">{{ row.url }}</td>
+              <td>{{ row.window_start }}</td>
+              <td>{{ row.distinct_entities }}</td>
+              <td>{{ row.total_shares }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="col-lg-6">
+        <h6>Top Hashtag Storms</h6>
+        <table class="table table-sm table-striped">
+          <thead><tr><th>Hashtag</th><th>Window</th><th>Entities</th><th>Uses</th></tr></thead>
+          <tbody>
+            {% for row in results.hashtag_storm_preview %}
+            <tr>
+              <td>{{ row.hashtag }}</td>
+              <td>{{ row.window_start }}</td>
+              <td>{{ row.distinct_entities }}</td>
+              <td>{{ row.total_shares }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col-lg-4">
+        <h6>Burst-Correlated Entity Pairs</h6>
+        <table class="table table-sm table-striped">
+          <thead><tr><th>A</th><th>B</th><th>r</th></tr></thead>
+          <tbody>
+            {% for row in results.burst_corr_preview %}
+            <tr><td>{{ row.entity_a }}</td><td>{{ row.entity_b }}</td><td>{{ "%.2f"|format(row.pearson_r) }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="col-lg-4">
+        <h6>Dormancy-Then-Burst</h6>
+        <table class="table table-sm table-striped">
+          <thead><tr><th>Entity</th><th>Dormant (d)</th><th>Burst</th></tr></thead>
+          <tbody>
+            {% for row in results.dormancy_preview %}
+            <tr><td>{{ row.entity }}</td><td>{{ "%.0f"|format(row.dormancy_days) }}</td><td>{{ row.events_in_burst }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="col-lg-4">
+        <h6>Hour-Profile Flags</h6>
+        <table class="table table-sm table-striped">
+          <thead><tr><th>Entity</th><th>Hrs/24</th><th>Entropy</th><th>Flag</th></tr></thead>
+          <tbody>
+            {% for row in results.hour_profile_preview %}
+            <tr>
+              <td>{{ row.entity }}</td>
+              <td>{{ row.active_hours_of_24 }}</td>
+              <td>{{ "%.2f"|format(row.hour_entropy_normalized) }}</td>
+              <td>{% if row.always_on_flag %}<span class="badge bg-warning">always-on</span>{% elif row.narrow_hours_flag %}<span class="badge bg-info">narrow</span>{% endif %}</td>
+            </tr>
             {% endfor %}
           </tbody>
         </table>
