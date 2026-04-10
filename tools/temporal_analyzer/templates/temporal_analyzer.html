@@ -63,6 +63,12 @@
       <div class="form-text">Used only when no hashtag column is provided; only literal <code>#tags</code> are extracted.</div>
     </div>
 
+    <div class="col-md-4">
+      <label class="form-label">ID Column (optional)</label>
+      <input type="text" class="form-control" name="id_col" placeholder="auto-detect (e.g. Resource Id, post_id)" value="{{ request.form.id_col or '' }}">
+      <div class="form-text">Stable row identifier, copied into the per-event sheets so you can join back to your source CSV.</div>
+    </div>
+
     <div class="col-md-3">
       <label class="form-label">Amplification Window (seconds)</label>
       <input type="number" class="form-control" name="amp_window_seconds" value="{{ request.form.amp_window_seconds or 300 }}" min="1" max="86400">
@@ -213,15 +219,20 @@
       Amplification window: {{ results.amp_window_seconds }}s.
       Using URL column <code>{{ results.url_col or '—' }}</code>,
       hashtag column <code>{{ results.hashtag_col or '—' }}</code>,
-      text column <code>{{ results.text_col or '—' }}</code>.
+      text column <code>{{ results.text_col or '—' }}</code>,
+      id column <code>{{ results.id_col or '—' }}</code>.
     </p>
     <ul class="mb-3">
-      <li>URL amplification windows flagged: <strong>{{ results.cib_counts.url_amplified_rows }}</strong></li>
-      <li>Hashtag storm windows flagged: <strong>{{ results.cib_counts.hashtag_storm_rows }}</strong></li>
+      <li>URL amplification windows flagged: <strong>{{ results.cib_counts.url_amplified_rows }}</strong> ({{ results.cib_counts.url_amp_events_n }} flagged posts)</li>
+      <li>Hashtag storm windows flagged: <strong>{{ results.cib_counts.hashtag_storm_rows }}</strong> ({{ results.cib_counts.hashtag_storm_events_n }} flagged posts)</li>
       <li>Burst-correlated entity pairs: <strong>{{ results.cib_counts.burst_correlated_pairs }}</strong></li>
       <li>Always-on entities: <strong>{{ results.cib_counts.entities_always_on }}</strong> — Narrow-hours: <strong>{{ results.cib_counts.entities_narrow_hours }}</strong></li>
       <li>Dormancy-then-burst entities: <strong>{{ results.cib_counts.dormancy_burst_entities }}</strong></li>
+      <li>Near-simultaneous posts: <strong>{{ results.cib_counts.near_sim_events_n }}</strong> — see <code>NEAR_SIM_EVENTS</code> sheet for post-level detail</li>
     </ul>
+    <div class="alert alert-info py-2 small mb-3">
+      Download the Excel export to get <code>NEAR_SIM_EVENTS</code>, <code>URL_AMP_EVENTS</code>, and <code>HASHTAG_STORM_EVENTS</code> — one row per flagged post, with <code>window_id</code>/<code>group_id</code>, <code>row_index</code>, and (if provided) your <code>id</code> and <code>text</code> columns. Filter by window/group and feed the text into the Text Cluster tool.
+    </div>
 
     <div class="row">
       <div class="col-lg-6">

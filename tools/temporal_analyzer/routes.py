@@ -137,6 +137,10 @@ _TEXT_COL_RE = re.compile(
     r"(?:^|[_\W])(text|body|message|content|caption|full[_\s]?text|post|title)(?:$|[_\W])",
     re.I,
 )
+_ID_COL_RE = re.compile(
+    r"(?:^|[_\W])(post[_\s]?id|resource[_\s]?id|mention[_\s]?id|thread[_\s]?id|tweet[_\s]?id|id)(?:$|[_\W])",
+    re.I,
+)
 
 _URL_EXTRACT_RE = re.compile(r"https?://[^\s,;\"'<>\]\[|]+", re.I)
 _HASHTAG_EXTRACT_RE = re.compile(r"#[\w\u00C0-\uFFFF]+")
@@ -221,18 +225,21 @@ def _tokenize_hashtags(cell, strict: bool = True) -> list[str]:
 
 def _explode_tokens(df_work: pd.DataFrame, source: Optional[pd.Series], tokenizer, col_name: str) -> pd.DataFrame:
     """
-    Expand each event into (ts, entity, token) rows by applying *tokenizer* to the
-    aligned value in *source*. Aligns on df_work's original index.
+    Expand each event into (ts, entity, token, row_index) rows by applying
+    *tokenizer* to the aligned value in *source*. Aligns on df_work's original index.
+    The *row_index* column preserves the source-CSV row number for later lookups.
     """
+    cols_out = list(df_work.columns) + [col_name, "row_index"]
     if source is None or df_work.empty:
-        return pd.DataFrame(columns=list(df_work.columns) + [col_name])
+        return pd.DataFrame(columns=cols_out)
     aligned = source.reindex(df_work.index)
     tokens = aligned.apply(tokenizer)
     base = df_work.copy()
+    base["row_index"] = base.index
     base[col_name] = tokens
     base = base[base[col_name].map(lambda x: isinstance(x, list) and len(x) > 0)]
     if base.empty:
-        return pd.DataFrame(columns=list(df_work.columns) + [col_name])
+        return pd.DataFrame(columns=cols_out)
     return base.explode(col_name, ignore_index=True).dropna(subset=[col_name, "ts"])
 
 
@@ -502,9 +509,11 @@ def _entity_near_simultaneity_and_jitter(
             lambda lst: ", ".join(map(str, lst[:20])) + (" …" if len(lst) > 20 else "")
         )
         near_sim_windows = win_multi[["window_start", "window_end", "event_count", "unique_entities", "entities"]] \
-            .sort_values(["unique_entities", "event_count"], ascending=[False, False])
+            .sort_values(["unique_entities", "event_count"], ascending=[False, False]) \
+            .reset_index(drop=True)
+        near_sim_windows.insert(0, "window_id", range(1, len(near_sim_windows) + 1))
     else:
-        near_sim_windows = pd.DataFrame(columns=["window_start", "window_end", "event_count", "unique_entities", "entities"])
+        near_sim_windows = pd.DataFrame(columns=["window_id", "window_start", "window_end", "event_count", "unique_entities", "entities"])
     windows_copost_n = int(len(near_sim_windows))
 
     # Per-event copost flag
@@ -628,7 +637,7 @@ def _analyze_amplification(
         entities_list=("entity", lambda x: list(pd.unique(x))),
     ).reset_index()
     grp = grp[grp["distinct_entities"] >= int(min_entities)].copy()
-    cols = [token_col, "window_start", "first_ts", "last_ts", "distinct_entities", "total_shares", "entities"]
+    cols = ["group_id", token_col, "window_start", "first_ts", "last_ts", "distinct_entities", "total_shares", "entities"]
     if grp.empty:
         return pd.DataFrame(columns=cols)
     grp = grp.rename(columns={"bin": "window_start"})
@@ -636,9 +645,11 @@ def _analyze_amplification(
         lambda lst: ", ".join(map(str, lst[:20])) + (" …" if len(lst) > 20 else "")
     )
     grp = grp.drop(columns=["entities_list"])
-    return grp[cols].sort_values(
+    result = grp.sort_values(
         ["distinct_entities", "total_shares"], ascending=[False, False]
     ).reset_index(drop=True)
+    result.insert(0, "group_id", range(1, len(result) + 1))
+    return result[cols]
 
 
 def _analyze_entity_hour_profile(df_work: pd.DataFrame) -> pd.DataFrame:
@@ -786,6 +797,7 @@ def analyze_temporal(
     url_col: Optional[str] = None,
     hashtag_col: Optional[str] = None,
     text_col: Optional[str] = None,
+    id_col: Optional[str] = None,
     amp_window_seconds: int = 300,
     min_amp_entities: int = 3,
     dormancy_days: float = 30,
@@ -839,6 +851,8 @@ def analyze_temporal(
     entity_hour_profile = pd.DataFrame()
     burst_correlation = pd.DataFrame()
     dormancy_bursts = pd.DataFrame()
+    url_exploded: pd.DataFrame = pd.DataFrame()
+    tag_exploded: pd.DataFrame = pd.DataFrame()
 
     if entity_mode:
         # URL amplification
@@ -876,6 +890,75 @@ def analyze_temporal(
             burst_hours=burst_hours,
             min_burst_events=min_burst_events,
         )
+
+    # 5c) Per-event detail sheets for flagged groups (joins back to source CSV).
+    near_sim_events = pd.DataFrame()
+    url_amp_events = pd.DataFrame()
+    hashtag_storm_events = pd.DataFrame()
+
+    def _attach_source_cols(events: pd.DataFrame, index_col: str = "row_index") -> pd.DataFrame:
+        """Enrich an events frame with id/text/url columns looked up from the source df."""
+        if events.empty or index_col not in events.columns:
+            return events
+        out = events.copy()
+        idx = pd.Index(out[index_col].tolist())
+        if id_col and id_col in df.columns:
+            out["id"] = df[id_col].reindex(idx).to_numpy()
+        if text_col and text_col in df.columns:
+            out["text"] = df[text_col].reindex(idx).to_numpy()
+        # For near-sim events only, add the raw URL cell (context); URL/hashtag amp events
+        # already carry the token, so skip there.
+        return out
+
+    if entity_mode and not near_sim_windows.empty:
+        bin_freq = f"{int(co_window_seconds)}s"
+        dfw = df_work.copy()
+        dfw["bin"] = dfw["ts"].dt.floor(bin_freq)
+        dfw["row_index"] = dfw.index
+        flagged = near_sim_windows[["window_id", "window_start", "window_end", "unique_entities"]].rename(
+            columns={"window_start": "bin"}
+        )
+        events = dfw.merge(flagged, on="bin", how="inner")
+        # Include the raw URL cell for near-sim (it's the most useful context column here)
+        if url_col and url_col in df.columns:
+            events["url"] = df[url_col].reindex(pd.Index(events["row_index"])).to_numpy()
+        events = events.rename(columns={"bin": "window_start"})
+        events = _attach_source_cols(events)
+        cols = ["window_id", "window_start", "window_end", "unique_entities", "ts", "entity", "row_index"]
+        for extra in ("id", "text", "url"):
+            if extra in events.columns:
+                cols.append(extra)
+        near_sim_events = events[cols].sort_values(["window_id", "ts"]).reset_index(drop=True)
+
+    if entity_mode and not url_amplification.empty and not url_exploded.empty:
+        ue = url_exploded.copy()
+        ue["bin"] = ue["ts"].dt.floor(f"{int(amp_window_seconds)}s")
+        keys = url_amplification[["group_id", "url", "window_start", "distinct_entities"]].rename(
+            columns={"window_start": "bin"}
+        )
+        events = ue.merge(keys, on=["url", "bin"], how="inner")
+        events = events.rename(columns={"bin": "window_start"})
+        events = _attach_source_cols(events)
+        cols = ["group_id", "url", "window_start", "distinct_entities", "ts", "entity", "row_index"]
+        for extra in ("id", "text"):
+            if extra in events.columns:
+                cols.append(extra)
+        url_amp_events = events[cols].sort_values(["group_id", "ts"]).reset_index(drop=True)
+
+    if entity_mode and not hashtag_storms.empty and not tag_exploded.empty:
+        te = tag_exploded.copy()
+        te["bin"] = te["ts"].dt.floor(f"{int(amp_window_seconds)}s")
+        keys = hashtag_storms[["group_id", "hashtag", "window_start", "distinct_entities"]].rename(
+            columns={"window_start": "bin"}
+        )
+        events = te.merge(keys, on=["hashtag", "bin"], how="inner")
+        events = events.rename(columns={"bin": "window_start"})
+        events = _attach_source_cols(events)
+        cols = ["group_id", "hashtag", "window_start", "distinct_entities", "ts", "entity", "row_index"]
+        for extra in ("id", "text"):
+            if extra in events.columns:
+                cols.append(extra)
+        hashtag_storm_events = events[cols].sort_values(["group_id", "ts"]).reset_index(drop=True)
 
     # 6) Indicator table (single-row summary)
     indicators = pd.DataFrame([{
@@ -917,6 +1000,9 @@ def analyze_temporal(
         "entities_narrow_hours": int(entity_hour_profile["narrow_hours_flag"].sum()) if not entity_hour_profile.empty else 0,
         "burst_correlated_pairs": int(len(burst_correlation)),
         "dormancy_burst_entities": int(len(dormancy_bursts)),
+        "near_sim_events_n": int(len(near_sim_events)),
+        "url_amp_events_n": int(len(url_amp_events)),
+        "hashtag_storm_events_n": int(len(hashtag_storm_events)),
     }])
 
     # 7) Compile return payload
@@ -937,6 +1023,9 @@ def analyze_temporal(
         "ENTITY_HOUR_PROFILE": entity_hour_profile,
         "BURST_CORRELATION": burst_correlation,
         "DORMANCY_BURSTS": dormancy_bursts,
+        "NEAR_SIM_EVENTS": near_sim_events,
+        "URL_AMP_EVENTS": url_amp_events,
+        "HASHTAG_STORM_EVENTS": hashtag_storm_events,
         "_preview": {
             "total": int(indicators.loc[0, "total_events"]),
             "start": str(indicators.loc[0, "start"]),
@@ -962,6 +1051,7 @@ def temporal():
         url_col_req = (request.form.get("url_col") or "").strip() or None
         hashtag_col_req = (request.form.get("hashtag_col") or "").strip() or None
         text_col_req = (request.form.get("text_col") or "").strip() or None
+        id_col_req = (request.form.get("id_col") or "").strip() or None
 
         def _int_form(name: str, default: int) -> int:
             try:
@@ -1028,6 +1118,14 @@ def temporal():
             df, text_col_req, _TEXT_COL_RE,
             preferred_names=["full text", "text", "body", "message", "content", "caption"],
         )
+        id_col = _pick_column(
+            df, id_col_req, _ID_COL_RE,
+            preferred_names=[
+                "post id", "postid", "resource id", "resourceid",
+                "mention id", "mentionid", "thread id", "threadid",
+                "tweet id", "tweetid", "id",
+            ],
+        )
 
         try:
             out = analyze_temporal(
@@ -1037,6 +1135,7 @@ def temporal():
                 url_col=url_col,
                 hashtag_col=hashtag_col,
                 text_col=text_col,
+                id_col=id_col,
                 amp_window_seconds=amp_window_seconds,
                 min_amp_entities=min_amp_entities,
                 dormancy_days=dormancy_days,
@@ -1058,6 +1157,7 @@ def temporal():
                     "url_column": url_col or "(none)",
                     "hashtag_column": hashtag_col or "(none)",
                     "text_column": text_col or "(none)",
+                    "id_column": id_col or "(none)",
                     "co_window_seconds": co_window_seconds,
                     "timezone": tz_name or "UTC (as-parsed)",
                     **out["INDICATORS"].iloc[0].to_dict()
@@ -1093,6 +1193,11 @@ def temporal():
                 _excel_safe(out["ENTITY_HOUR_PROFILE"]).to_excel(writer, sheet_name="ENTITY_HOUR_PROFILE", index=False)
                 _excel_safe(out["BURST_CORRELATION"]).to_excel(writer, sheet_name="BURST_CORRELATION", index=False)
                 _excel_safe(out["DORMANCY_BURSTS"]).to_excel(writer, sheet_name="DORMANCY_BURSTS", index=False)
+
+                # Per-event detail for flagged groups (joinable back to source CSV)
+                _excel_safe(out["NEAR_SIM_EVENTS"]).to_excel(writer, sheet_name="NEAR_SIM_EVENTS", index=False)
+                _excel_safe(out["URL_AMP_EVENTS"]).to_excel(writer, sheet_name="URL_AMP_EVENTS", index=False)
+                _excel_safe(out["HASHTAG_STORM_EVENTS"]).to_excel(writer, sheet_name="HASHTAG_STORM_EVENTS", index=False)
 
             output.seek(0)
             return send_file(
@@ -1134,6 +1239,7 @@ def temporal():
             "url_col": url_col or "",
             "hashtag_col": hashtag_col or "",
             "text_col": text_col or "",
+            "id_col": id_col or "",
             "co_window_seconds": co_window_seconds,
             "amp_window_seconds": amp_window_seconds,
             "summary": preview,
@@ -1155,6 +1261,9 @@ def temporal():
                 "entities_narrow_hours": int(ind["entities_narrow_hours"]),
                 "burst_correlated_pairs": int(ind["burst_correlated_pairs"]),
                 "dormancy_burst_entities": int(ind["dormancy_burst_entities"]),
+                "near_sim_events_n": int(ind["near_sim_events_n"]),
+                "url_amp_events_n": int(ind["url_amp_events_n"]),
+                "hashtag_storm_events_n": int(ind["hashtag_storm_events_n"]),
             },
         }
 
