@@ -77,6 +77,25 @@
       <button class="btn btn-primary w-100" type="submit">Cluster</button>
     </div>
   </div>
+
+  {# --- Differentiator & partition (optional) --- #}
+  <div class="row g-3 align-items-end mt-1">
+    <div class="col-sm-4">
+      <label class="form-label">Differentiator column <span class="text-muted">(optional)</span></label>
+      <input class="form-control" type="text" name="differentiator_col" value="{{ request.form.get('differentiator_col', '') }}" placeholder="e.g. author, user_id, domain">
+      <div class="form-text">CSV column that distinguishes sources. Used to filter out clusters that are just one source repeating itself.</div>
+    </div>
+    <div class="col-sm-3">
+      <label class="form-label">Min distinct differentiators</label>
+      <input class="form-control" type="number" name="min_distinct_differentiators" min="1" step="1" value="{{ min_distinct_differentiators or 1 }}">
+      <div class="form-text">Clusters with fewer distinct values are hidden. Set to 2+ to require cross-source overlap.</div>
+    </div>
+    <div class="col-sm-4">
+      <label class="form-label">Cluster within column <span class="text-muted">(optional)</span></label>
+      <input class="form-control" type="text" name="partition_col" value="{{ request.form.get('partition_col', '') }}" placeholder="e.g. window_id, group_id">
+      <div class="form-text">Clustering runs <em>independently</em> within each value. Pair with <code>NEAR_SIM_EVENTS</code> / <code>URL_AMP_EVENTS</code> from the temporal analyzer to find textually similar posts inside each flagged window.</div>
+    </div>
+  </div>
 </form>
 
 {% if clusters %}
@@ -92,15 +111,30 @@
   {% for cluster in clusters %}
     <div class="card mb-3">
       <div class="card-header d-flex justify-content-between align-items-center">
-        <div>Cluster {{ cluster.id }}</div>
-        <span class="badge bg-secondary">{{ cluster.size }} item{{ 's' if cluster.size != 1 else '' }}</span>
+        <div>
+          Cluster {{ cluster.id }}
+          {% if cluster.partition is defined and cluster.partition %}
+            <span class="badge bg-dark ms-2" title="{{ partition_col_used or 'partition' }}">{{ partition_col_used or 'partition' }}={{ cluster.partition }}</span>
+          {% endif %}
+        </div>
+        <div>
+          {% if cluster.distinct_differentiators is not none %}
+            <span class="badge bg-info me-1" title="Distinct {{ differentiator_col_used or 'differentiator' }} values in this cluster">{{ cluster.distinct_differentiators }} distinct {{ differentiator_col_used or 'source' }}{{ 's' if cluster.distinct_differentiators != 1 else '' }}</span>
+          {% endif %}
+          <span class="badge bg-secondary">{{ cluster.size }} item{{ 's' if cluster.size != 1 else '' }}</span>
+        </div>
       </div>
       <ul class="list-group list-group-flush">
         {% for item in cluster.members[:50] %}
           <li class="list-group-item">
             <div class="d-flex justify-content-between">
-              <div>{{ item.text }}</div>
-              <small class="text-muted">{{ "%.2f"|format(item.similarity) }}</small>
+              <div>
+                {% if item.differentiator is defined and item.differentiator %}
+                  <span class="badge bg-light text-dark border me-2">{{ item.differentiator }}</span>
+                {% endif %}
+                {{ item.text }}
+              </div>
+              <small class="text-muted ms-2">{{ "%.2f"|format(item.similarity) }}</small>
             </div>
           </li>
         {% endfor %}

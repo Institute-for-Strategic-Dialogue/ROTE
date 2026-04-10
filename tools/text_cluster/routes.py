@@ -117,8 +117,20 @@ def _encode(texts: list[str]) -> np.ndarray:
 # Mode 1 – Near-duplicate detection  (greedy cosine-threshold clustering)
 # ---------------------------------------------------------------------------
 
+def _distinct_count(differentiators: list[str] | None, indices) -> int | None:
+    """Return the number of distinct non-empty differentiator values across *indices*, or None."""
+    if differentiators is None:
+        return None
+    return len({differentiators[i] for i in indices if differentiators[i]})
+
+
 def _cluster_neardup(
-    texts: list[str], embeddings: np.ndarray, threshold: float, min_cluster_size: int
+    texts: list[str],
+    embeddings: np.ndarray,
+    threshold: float,
+    min_cluster_size: int,
+    differentiators: list[str] | None = None,
+    min_distinct_differentiators: int = 1,
 ) -> tuple[list[dict], list[dict]]:
     n = len(texts)
 
@@ -134,32 +146,42 @@ def _cluster_neardup(
         mask = (sims >= threshold) & ~visited
         indices = np.where(mask)[0]
         visited[indices] = True
-        members = [
-            {"text": texts[idx], "similarity": float(sims[idx])}
-            for idx in indices
-        ]
+        members = []
+        for idx in indices:
+            m = {"text": texts[idx], "similarity": float(sims[idx])}
+            if differentiators is not None:
+                m["differentiator"] = differentiators[idx]
+            members.append(m)
         clusters.append(
             {
                 "id": None,
                 "size": len(members),
                 "members": members,
                 "indices": indices.tolist(),
+                "distinct_differentiators": _distinct_count(differentiators, indices),
             }
         )
 
     # Order clusters by size descending for readability
     clusters.sort(key=lambda c: c["size"], reverse=True)
-    assignments = [{"cluster_id": "", "cluster_size": 1} for _ in range(n)]
+    assignments = [
+        {"cluster_id": "", "cluster_size": 1, "cluster_distinct_differentiators": ""}
+        for _ in range(n)
+    ]
 
     next_id = 1
     for cluster in clusters:
-        if cluster["size"] >= min_cluster_size:
+        meets_size = cluster["size"] >= min_cluster_size
+        distinct = cluster["distinct_differentiators"]
+        meets_diffs = differentiators is None or (distinct is not None and distinct >= int(min_distinct_differentiators))
+        if meets_size and meets_diffs:
             cluster["id"] = next_id
             next_id += 1
         for text_idx in cluster["indices"]:
             assignments[text_idx] = {
                 "cluster_id": cluster["id"] or "",
                 "cluster_size": cluster["size"],
+                "cluster_distinct_differentiators": distinct if distinct is not None else "",
             }
 
     display_clusters = [c for c in clusters if c["id"] is not None]
@@ -171,7 +193,12 @@ def _cluster_neardup(
 # ---------------------------------------------------------------------------
 
 def _cluster_semantic(
-    texts: list[str], embeddings: np.ndarray, n_clusters: int, min_cluster_size: int
+    texts: list[str],
+    embeddings: np.ndarray,
+    n_clusters: int,
+    min_cluster_size: int,
+    differentiators: list[str] | None = None,
+    min_distinct_differentiators: int = 1,
 ) -> tuple[list[dict], list[dict]]:
     n = len(texts)
     n_clusters = max(2, min(n_clusters, n))
@@ -194,31 +221,123 @@ def _cluster_semantic(
     # Build output sorted by cluster size
     sorted_labels = sorted(groups, key=lambda k: len(groups[k]), reverse=True)
     clusters = []
-    assignments = [{"cluster_id": "", "cluster_size": 1} for _ in range(n)]
+    assignments = [
+        {"cluster_id": "", "cluster_size": 1, "cluster_distinct_differentiators": ""}
+        for _ in range(n)
+    ]
 
     next_id = 1
     for label in sorted_labels:
         members_data = sorted(groups[label], key=lambda t: t[1], reverse=True)
         size = len(members_data)
         indices = [idx for idx, _ in members_data]
-        members = [
-            {"text": texts[idx], "similarity": sim} for idx, sim in members_data
-        ]
+        members = []
+        for idx, sim in members_data:
+            m = {"text": texts[idx], "similarity": sim}
+            if differentiators is not None:
+                m["differentiator"] = differentiators[idx]
+            members.append(m)
+
+        distinct = _distinct_count(differentiators, indices)
+        meets_size = size >= min_cluster_size
+        meets_diffs = differentiators is None or (distinct is not None and distinct >= int(min_distinct_differentiators))
         cluster_id = None
-        if size >= min_cluster_size:
+        if meets_size and meets_diffs:
             cluster_id = next_id
             next_id += 1
         clusters.append(
-            {"id": cluster_id, "size": size, "members": members, "indices": indices}
+            {
+                "id": cluster_id,
+                "size": size,
+                "members": members,
+                "indices": indices,
+                "distinct_differentiators": distinct,
+            }
         )
         for idx, _ in members_data:
             assignments[idx] = {
                 "cluster_id": cluster_id or "",
                 "cluster_size": size,
+                "cluster_distinct_differentiators": distinct if distinct is not None else "",
             }
 
     display_clusters = [c for c in clusters if c["id"] is not None]
     return display_clusters, assignments
+
+
+def _cluster_within_partitions(
+    cluster_fn,
+    texts: list[str],
+    embeddings: np.ndarray,
+    partitions: list[str],
+    differentiators: list[str] | None,
+    min_distinct_differentiators: int,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Run *cluster_fn* independently inside each bucket of *partitions*.
+    *cluster_fn* must accept (sub_texts, sub_embeddings, differentiators, min_distinct_differentiators)
+    and return (display_clusters, assignments) in the same shape as _cluster_neardup / _cluster_semantic.
+    Results are merged with globally-unique cluster IDs sorted by size.
+    """
+    n = len(texts)
+    buckets: dict[str, list[int]] = defaultdict(list)
+    for i, p in enumerate(partitions):
+        buckets[p if p else "(empty)"].append(i)
+
+    all_clusters: list[dict] = []
+    assignments = [
+        {"cluster_id": "", "cluster_size": 1, "cluster_distinct_differentiators": "", "cluster_partition": ""}
+        for _ in range(n)
+    ]
+    tmp_next = 1
+    for part_value, idx_list in buckets.items():
+        if len(idx_list) < 2:
+            # Still record the partition so the row shows up with its scope in the download.
+            for global_i in idx_list:
+                assignments[global_i]["cluster_partition"] = part_value
+            continue
+        sub_texts = [texts[i] for i in idx_list]
+        sub_emb = embeddings[idx_list]
+        sub_diffs = None
+        if differentiators is not None:
+            sub_diffs = [differentiators[i] for i in idx_list]
+        sub_clusters, sub_assignments = cluster_fn(
+            sub_texts, sub_emb,
+            differentiators=sub_diffs,
+            min_distinct_differentiators=min_distinct_differentiators,
+        )
+
+        # Temporary unique ids so we can remap at the end after a global sort.
+        local_to_tmp: dict = {}
+        for c in sub_clusters:
+            local_to_tmp[c["id"]] = tmp_next
+            c["id"] = tmp_next
+            c["partition"] = part_value
+            c["indices"] = [idx_list[i] for i in c["indices"]]
+            all_clusters.append(c)
+            tmp_next += 1
+
+        for local_i, global_i in enumerate(idx_list):
+            a = sub_assignments[local_i]
+            mapped = local_to_tmp.get(a["cluster_id"], "") if a["cluster_id"] else ""
+            assignments[global_i] = {
+                "cluster_id": mapped,
+                "cluster_size": a["cluster_size"],
+                "cluster_distinct_differentiators": a.get("cluster_distinct_differentiators", ""),
+                "cluster_partition": part_value,
+            }
+
+    # Final global sort-by-size and ID remap so the display order is stable.
+    all_clusters.sort(key=lambda c: c["size"], reverse=True)
+    tmp_to_final = {}
+    for final_id, c in enumerate(all_clusters, 1):
+        tmp_to_final[c["id"]] = final_id
+        c["id"] = final_id
+    for a in assignments:
+        if a["cluster_id"] and a["cluster_id"] in tmp_to_final:
+            a["cluster_id"] = tmp_to_final[a["cluster_id"]]
+
+    return all_clusters, assignments
 
 
 def _build_download_payload(
@@ -227,11 +346,15 @@ def _build_download_payload(
     assignments: list[dict],
     row_indices: list[int],
     min_cluster_size: int,
+    include_distinct_differentiators: bool = False,
+    include_partition: bool = False,
 ) -> tuple[list[dict], list[str]]:
     if not rows:
         return [], []
     cluster_ids = [""] * len(rows)
     cluster_sizes = [""] * len(rows)
+    cluster_distinct = [""] * len(rows)
+    cluster_partition = [""] * len(rows)
 
     for text_idx, row_idx in enumerate(row_indices):
         cluster_id = assignments[text_idx]["cluster_id"]
@@ -240,15 +363,25 @@ def _build_download_payload(
             cluster_id = ""
         cluster_ids[row_idx] = cluster_id
         cluster_sizes[row_idx] = cluster_size
+        cluster_distinct[row_idx] = assignments[text_idx].get("cluster_distinct_differentiators", "")
+        cluster_partition[row_idx] = assignments[text_idx].get("cluster_partition", "")
 
     output_rows = []
     for idx, row in enumerate(rows):
         row_out = {**row}
         row_out["cluster_id"] = cluster_ids[idx]
         row_out["cluster_size"] = cluster_sizes[idx]
+        if include_distinct_differentiators:
+            row_out["cluster_distinct_differentiators"] = cluster_distinct[idx]
+        if include_partition:
+            row_out["cluster_partition"] = cluster_partition[idx]
         output_rows.append(row_out)
 
     new_fields = list(fieldnames) + ["cluster_id", "cluster_size"]
+    if include_distinct_differentiators:
+        new_fields.append("cluster_distinct_differentiators")
+    if include_partition:
+        new_fields.append("cluster_partition")
     return output_rows, new_fields
 
 
@@ -261,6 +394,9 @@ def text_cluster():
 
     cluster_method = "neardup"
     n_clusters_target = 0
+    differentiator_col_used = ""
+    min_distinct_diffs = 1
+    partition_col_used = ""
 
     if request.method == "POST":
         cluster_method = request.form.get("cluster_method", "neardup")
@@ -269,6 +405,12 @@ def text_cluster():
         output_mode = request.form.get("output_mode", "table")
 
         text_column = (request.form.get("text_column") or "").strip() or None
+        differentiator_col = (request.form.get("differentiator_col") or "").strip() or None
+        partition_col = (request.form.get("partition_col") or "").strip() or None
+        try:
+            min_distinct_diffs = max(1, int(request.form.get("min_distinct_differentiators") or 1))
+        except (TypeError, ValueError):
+            min_distinct_diffs = 1
 
         pasted = _read_rows_from_form(request.form.get("texts"))
         uploaded = _read_rows_from_upload(request.files.get("text_file"), text_column=text_column)
@@ -280,26 +422,69 @@ def text_cluster():
         total = len(texts)
         assignments = []
 
+        # Align differentiator values to the filtered text list (row_indices map back to rows).
+        differentiators: list[str] | None = None
+        if differentiator_col and rows and differentiator_col in (fieldnames or []):
+            differentiators = [
+                (rows[row_idx].get(differentiator_col) or "").strip()
+                for row_idx in row_indices
+            ]
+            differentiator_col_used = differentiator_col
+
+        # Same alignment for partition values.
+        partitions: list[str] | None = None
+        if partition_col and rows and partition_col in (fieldnames or []):
+            partitions = [
+                (rows[row_idx].get(partition_col) or "").strip()
+                for row_idx in row_indices
+            ]
+            partition_col_used = partition_col
+
         if total > 0:
             embeddings = _encode(texts)
 
-            if cluster_method == "semantic":
-                raw_k = request.form.get("n_clusters", "")
-                try:
-                    n_clusters_target = max(2, int(raw_k))
-                except (TypeError, ValueError):
-                    n_clusters_target = max(2, int(total ** 0.5))
-                clusters, assignments = _cluster_semantic(
-                    texts, embeddings, n_clusters_target, min_cluster_size
+            raw_k = request.form.get("n_clusters", "")
+            try:
+                n_clusters_target = max(2, int(raw_k))
+            except (TypeError, ValueError):
+                n_clusters_target = max(2, int(total ** 0.5))
+
+            def _run_neardup(t, e, differentiators=None, min_distinct_differentiators=1):
+                return _cluster_neardup(
+                    t, e, threshold, min_cluster_size,
+                    differentiators=differentiators,
+                    min_distinct_differentiators=min_distinct_differentiators,
+                )
+
+            def _run_semantic(t, e, differentiators=None, min_distinct_differentiators=1):
+                # In partitioned mode each bucket auto-picks its own k by sqrt(bucket size).
+                k = max(2, int(len(t) ** 0.5)) if partitions is not None else n_clusters_target
+                return _cluster_semantic(
+                    t, e, k, min_cluster_size,
+                    differentiators=differentiators,
+                    min_distinct_differentiators=min_distinct_differentiators,
+                )
+
+            cluster_fn = _run_semantic if cluster_method == "semantic" else _run_neardup
+
+            if partitions is not None:
+                clusters, assignments = _cluster_within_partitions(
+                    cluster_fn, texts, embeddings, partitions,
+                    differentiators=differentiators,
+                    min_distinct_differentiators=min_distinct_diffs,
                 )
             else:
-                clusters, assignments = _cluster_neardup(
-                    texts, embeddings, threshold, min_cluster_size
+                clusters, assignments = cluster_fn(
+                    texts, embeddings,
+                    differentiators=differentiators,
+                    min_distinct_differentiators=min_distinct_diffs,
                 )
 
         if output_mode in {"csv", "excel"} and rows:
             output_rows, output_fields = _build_download_payload(
-                rows, fieldnames, assignments, row_indices, min_cluster_size
+                rows, fieldnames, assignments, row_indices, min_cluster_size,
+                include_distinct_differentiators=(differentiators is not None),
+                include_partition=(partitions is not None),
             )
             if output_mode == "csv":
                 output = io.StringIO(newline="")
@@ -336,4 +521,7 @@ def text_cluster():
         max_docs=MAX_DOCS,
         cluster_method=cluster_method,
         n_clusters_target=n_clusters_target,
+        differentiator_col_used=differentiator_col_used,
+        min_distinct_differentiators=min_distinct_diffs,
+        partition_col_used=partition_col_used,
     )
