@@ -1,0 +1,191 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row mb-4">
+  <div class="col-lg-9">
+    <h1 class="h3 mb-2">Social Post &amp; Account Status</h1>
+    <p class="text-muted mb-2">Check whether posts and accounts are still live, deleted, suspended, or protected. Built first for X / Twitter; designed to extend to other platforms.</p>
+    <div class="alert alert-info small mb-0">
+      <strong>Posts and accounts use different probes</strong> &mdash; pick one mode per submission.
+      <ul class="mb-0 mt-1">
+        <li><strong>Posts</strong> &mdash; oEmbed lookup. Cleanly distinguishes <em>live</em> vs <em>gone</em>, but cannot say <em>why</em> a post is gone (deleted, suspended, and protected all collapse to a 404).</li>
+        <li><strong>Accounts</strong> &mdash; multi-probe. For X: syndication endpoint plus a best-effort GraphQL probe. Splits <em>live</em>, <em>protected</em>, <em>suspended-or-deactivated</em>, and <em>never-existed</em>. Suspended vs deactivated cannot be reliably split &mdash; X collapses them on purpose. <em>unknown</em> means both probes ran but couldn&#39;t agree (typically rate-limit on syndication + empty GraphQL: handle could be never-existed <strong>or</strong> suspended/deactivated).</li>
+      </ul>
+      <div class="mt-1 text-muted">Account checks are rate-sensitive (X throttles the syndication endpoint aggressively). For lists &gt; ~30 accounts, increase the pause-between value.</div>
+    </div>
+  </div>
+</div>
+
+{% if error %}
+<div class="alert alert-warning">{{ error }}</div>
+{% endif %}
+
+<form method="post" enctype="multipart/form-data" class="mb-4">
+  <div class="row g-3 mb-3">
+    <div class="col-sm-3">
+      <label class="form-label">Mode</label>
+      <select class="form-select" name="mode" id="modeSelect">
+        <option value="post" {% if mode == "post" %}selected{% endif %}>Posts</option>
+        <option value="account" {% if mode == "account" %}selected{% endif %}>Accounts</option>
+      </select>
+      <div class="form-text" id="modeHelpPost" {% if mode != "post" %}style="display:none"{% endif %}>oEmbed: live vs gone.</div>
+      <div class="form-text" id="modeHelpAccount" {% if mode != "account" %}style="display:none"{% endif %}>Syndication + GraphQL: live / protected / suspended-or-deactivated / not-found.</div>
+    </div>
+    <div class="col-sm-3">
+      <label class="form-label">Default platform</label>
+      <select class="form-select" name="default_platform">
+        {% for p in platforms %}
+          <option value="{{ p.name }}" {% if p.name == default_platform %}selected{% endif %}>{{ p.display_name }}</option>
+        {% endfor %}
+      </select>
+      <div class="form-text">Used when not detectable from URL.</div>
+    </div>
+    <div class="col-sm-2">
+      <label class="form-label">Output</label>
+      <select class="form-select" name="output_mode">
+        {% set om = request.form.get("output_mode", "table") %}
+        <option value="table" {% if om == "table" %}selected{% endif %}>Table</option>
+        <option value="csv" {% if om == "csv" %}selected{% endif %}>Download CSV</option>
+        <option value="excel" {% if om == "excel" %}selected{% endif %}>Download Excel</option>
+      </select>
+    </div>
+    <div class="col-sm-2">
+      <label class="form-label">Pause between (sec)</label>
+      <input class="form-control" type="number" name="inter_request_pause" min="0" max="5" step="0.05" value="{{ request.form.get('inter_request_pause', '0.35') }}">
+      <div class="form-text">Higher = gentler on Cloudflare.</div>
+    </div>
+    <div class="col-sm-2 align-self-end">
+      <button class="btn btn-primary w-100" type="submit">Check status</button>
+    </div>
+  </div>
+
+  <div class="mb-3">
+    <label class="form-label">Paste inputs (one per line)</label>
+    <textarea class="form-control" name="inputs" rows="6" placeholder="https://x.com/user/status/1234567890
+https://x.com/some_user
+some_user (treated as username for default platform)">{{ request.form.get("inputs", "") }}</textarea>
+    <div class="form-text">URLs preferred. Bare handles work for Accounts mode (treated as usernames for the default platform). Up to 5,000 rows.</div>
+  </div>
+
+  <div class="mb-3">
+    <label class="form-label">Or upload CSV</label>
+    <input class="form-control" type="file" name="csv_file" accept=".csv,.txt">
+    <div class="form-text">CSV: identifier column auto-detected (<code>url</code>, <code>account</code>, <code>username</code>, &hellip;) or specify below. Optional <code>platform</code> column overrides URL autodetect. All original columns are preserved on output.</div>
+  </div>
+
+  <div class="row g-3 align-items-end">
+    <div class="col-sm-4">
+      <label class="form-label">Identifier column</label>
+      <input class="form-control" type="text" name="identifier_col" value="{{ request.form.get('identifier_col', '') }}" placeholder="auto-detect">
+    </div>
+    <div class="col-sm-4">
+      <label class="form-label">Platform column <span class="text-muted">(optional)</span></label>
+      <input class="form-control" type="text" name="platform_col" value="{{ request.form.get('platform_col', '') }}" placeholder="e.g. platform">
+    </div>
+  </div>
+</form>
+
+{% if results is defined and results %}
+  <hr class="my-4">
+  <div class="d-flex justify-content-between align-items-end mb-2">
+    <div>
+      <strong>{{ total }}</strong> result{{ '' if total == 1 else 's' }}
+      {% if counts %}
+        &nbsp;
+        {% if counts.live %}<span class="badge bg-success me-1">{{ counts.live }} live</span>{% endif %}
+        {% if counts.gone %}<span class="badge bg-secondary me-1">{{ counts.gone }} gone</span>{% endif %}
+        {% if counts.protected %}<span class="badge bg-warning text-dark me-1">{{ counts.protected }} protected</span>{% endif %}
+        {% if counts.suspended_or_deactivated %}<span class="badge bg-dark me-1">{{ counts.suspended_or_deactivated }} suspended/deactivated</span>{% endif %}
+        {% if counts.suspended %}<span class="badge bg-dark me-1">{{ counts.suspended }} suspended</span>{% endif %}
+        {% if counts.deactivated %}<span class="badge bg-dark me-1">{{ counts.deactivated }} deactivated</span>{% endif %}
+        {% if counts.not_found %}<span class="badge bg-light text-dark border me-1">{{ counts.not_found }} not found</span>{% endif %}
+        {% if counts.unknown %}<span class="badge bg-info text-dark me-1">{{ counts.unknown }} unknown</span>{% endif %}
+        {% if counts.rate_limited %}<span class="badge bg-warning text-dark me-1">{{ counts.rate_limited }} rate-limited</span>{% endif %}
+        {% if counts.error %}<span class="badge bg-danger me-1">{{ counts.error }} error</span>{% endif %}
+        {% if counts.invalid_url %}<span class="badge bg-danger me-1">{{ counts.invalid_url }} invalid</span>{% endif %}
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm table-striped align-middle">
+      <thead class="table-light">
+        <tr>
+          <th>input</th>
+          <th>platform</th>
+          <th>identifier</th>
+          <th>status</th>
+          <th>label / detail</th>
+          <th>author</th>
+          {% if mode == "account" %}
+            <th class="text-end">followers</th>
+            <th class="text-end">tweets</th>
+          {% else %}
+            <th>title</th>
+          {% endif %}
+          <th>checked_at</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in results %}
+          {% set badge = "secondary" %}
+          {% if r.status == "live" %}{% set badge = "success" %}{% endif %}
+          {% if r.status == "gone" %}{% set badge = "secondary" %}{% endif %}
+          {% if r.status == "protected" %}{% set badge = "warning text-dark" %}{% endif %}
+          {% if r.status in ("suspended_or_deactivated", "suspended", "deactivated") %}{% set badge = "dark" %}{% endif %}
+          {% if r.status == "not_found" %}{% set badge = "light text-dark border" %}{% endif %}
+          {% if r.status == "unknown" %}{% set badge = "info text-dark" %}{% endif %}
+          {% if r.status == "rate_limited" %}{% set badge = "warning text-dark" %}{% endif %}
+          {% if r.status in ("error", "invalid_url") %}{% set badge = "danger" %}{% endif %}
+          <tr>
+            <td style="max-width: 280px; word-break: break-all;">{{ r.input }}</td>
+            <td>{{ r.platform or '' }}</td>
+            <td>
+              {% if r.normalized_url %}
+                <a href="{{ r.normalized_url }}" target="_blank" rel="noopener">{{ r.identifier or r.normalized_url }}</a>
+              {% else %}
+                {{ r.identifier or '' }}
+              {% endif %}
+            </td>
+            <td><span class="badge bg-{{ badge }}">{{ r.status }}</span></td>
+            <td>
+              <div>{{ r.status_label or '' }}</div>
+              {% if r.detail %}<div class="text-muted small">{{ r.detail }}</div>{% endif %}
+              {% if r.error %}<div class="text-danger small">{{ r.error }}</div>{% endif %}
+            </td>
+            <td>
+              {% if r.author_handle %}
+                <div>@{{ r.author_handle }}</div>
+                {% if r.author_name %}<div class="text-muted small">{{ r.author_name }}</div>{% endif %}
+              {% elif r.author_name %}
+                {{ r.author_name }}
+              {% endif %}
+            </td>
+            {% if mode == "account" %}
+              <td class="text-end">{{ '{:,}'.format(r.followers) if r.followers is not none else '' }}</td>
+              <td class="text-end">{{ '{:,}'.format(r.statuses) if r.statuses is not none else '' }}</td>
+            {% else %}
+              <td style="max-width: 320px; word-break: break-word;">{{ r.oembed_title or '' }}</td>
+            {% endif %}
+            <td class="text-muted small">{{ r.checked_at }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="small text-muted">For large jobs, prefer CSV/Excel download to skip the on-page table.</p>
+{% endif %}
+
+<script>
+(function () {
+  var sel = document.getElementById('modeSelect');
+  if (!sel) return;
+  sel.addEventListener('change', function () {
+    var isAccount = this.value === 'account';
+    var hp = document.getElementById('modeHelpPost');
+    var ha = document.getElementById('modeHelpAccount');
+    if (hp) hp.style.display = isAccount ? 'none' : '';
+    if (ha) ha.style.display = isAccount ? '' : 'none';
+  });
+})();
+</script>
+{% endblock %}
