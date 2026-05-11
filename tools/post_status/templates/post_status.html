@@ -86,7 +86,7 @@ some_user (treated as username for default platform)">{{ request.form.get("input
 
 {% if results is defined and results %}
   <hr class="my-4">
-  <div class="d-flex justify-content-between align-items-end mb-2">
+  <div class="d-flex justify-content-between align-items-end flex-wrap gap-2 mb-2">
     <div>
       <strong>{{ total }}</strong> result{{ '' if total == 1 else 's' }}
       {% if counts %}
@@ -104,7 +104,22 @@ some_user (treated as username for default platform)">{{ request.form.get("input
         {% if counts.invalid_url %}<span class="badge bg-danger me-1">{{ counts.invalid_url }} invalid</span>{% endif %}
       {% endif %}
     </div>
+    {% if download_csv_b64 %}
+      <div class="btn-group btn-group-sm" role="group" aria-label="Download results">
+        <a class="btn btn-outline-primary"
+           download="{{ download_filename_csv }}"
+           href="data:text/csv;base64,{{ download_csv_b64 }}">
+          <i class="bi bi-filetype-csv"></i> Download CSV
+        </a>
+        <a class="btn btn-outline-primary"
+           download="{{ download_filename_xlsx }}"
+           href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{{ download_xlsx_b64 }}">
+          <i class="bi bi-file-earmark-excel"></i> Download Excel
+        </a>
+      </div>
+    {% endif %}
   </div>
+  {% if download_csv_b64 %}<p class="small text-muted mb-2">Downloads include every column from your input CSV plus all status fields, so original metadata is preserved.</p>{% endif %}
 
   <div class="table-responsive">
     <table class="table table-sm table-striped align-middle">

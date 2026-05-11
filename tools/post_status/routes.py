@@ -16,6 +16,7 @@ column). All original CSV columns are preserved on output.
 """
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import time
@@ -265,7 +266,24 @@ def post_status_view():
             download_name=f"post_status_{mode}.xlsx",
         )
 
+    # Also build CSV + Excel and embed as base64 data URLs, so the user can
+    # see the table AND download in either format without re-running the
+    # probes (which would re-hit rate limits).
+    csv_buf = io.StringIO()
+    df.to_csv(csv_buf, index=False)
+    csv_bytes = csv_buf.getvalue().encode("utf-8")
+    csv_b64 = base64.b64encode(csv_bytes).decode("ascii")
+
+    xlsx_buf = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, sheet_name=f"{mode}_status", index=False)
+    xlsx_b64 = base64.b64encode(xlsx_buf.getvalue()).decode("ascii")
+
     ctx["results"] = rows
     ctx["total"] = len(rows)
     ctx["counts"] = counts
+    ctx["download_csv_b64"] = csv_b64
+    ctx["download_xlsx_b64"] = xlsx_b64
+    ctx["download_filename_csv"] = f"post_status_{mode}.csv"
+    ctx["download_filename_xlsx"] = f"post_status_{mode}.xlsx"
     return render_template("post_status.html", **ctx)
