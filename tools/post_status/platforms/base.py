@@ -28,6 +28,7 @@ STATUS_UNKNOWN = "unknown"                          # probes ran but verdict amb
 STATUS_ERROR = "error"
 STATUS_INVALID = "invalid_url"
 STATUS_RATE_LIMITED = "rate_limited"                # transient throttling, may resolve on retry
+STATUS_SKIPPED = "skipped"                          # never attempted (e.g. aborted batch)
 
 
 @dataclass

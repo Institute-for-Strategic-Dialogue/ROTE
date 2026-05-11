@@ -38,13 +38,25 @@ from .platforms.base import (
     StatusResult,
     STATUS_ERROR,
     STATUS_INVALID,
+    STATUS_RATE_LIMITED,
+    STATUS_SKIPPED,
 )
 
 post_status_bp = Blueprint("post_status", __name__, template_folder="templates")
 
-MAX_INPUTS = 5_000
+MAX_INPUTS = 10_000
 DEFAULT_INTER_REQUEST_PAUSE_SEC = 0.35  # gentle on Cloudflare
 MAX_PAUSE_SEC = 5.0
+# Stop probing once we hit this many rate-limit verdicts in a row -- saves the
+# user from waiting on a batch that will mostly come back as "I don't know".
+# The remaining items get marked STATUS_SKIPPED so the user can re-submit them.
+ABORT_AFTER_CONSECUTIVE_RATE_LIMITS = 5
+# Account checks are far more rate-sensitive than post checks (syndication
+# throttles aggressively). Above this, surface a warning + chunking hint.
+SIZE_WARNING_THRESHOLD_ACCOUNT = 500
+# Cap on-page table rows so the browser doesn't choke on a 10k-row DOM table.
+# Downloads include the full set regardless.
+MAX_TABLE_ROWS = 500
 
 
 def _safe(x) -> str:
@@ -71,8 +83,14 @@ def _parse_csv(file_storage, identifier_col: str, platform_col: str) -> list[dic
     buf = io.StringIO(raw)
     sample = buf.read(4096)
     buf.seek(0)
+    # Restrict the Sniffer to plausible CSV delimiters. Without this, on a
+    # single-column file the sniffer happily picks any common character
+    # (e.g. "u" if every line is "user0001...") and shreds the data.
     try:
-        dialect = csv.Sniffer().sniff(sample) if sample.strip() else csv.excel
+        dialect = (
+            csv.Sniffer().sniff(sample, delimiters=",;\t|")
+            if sample.strip() else csv.excel
+        )
     except csv.Error:
         dialect = csv.excel
     reader = csv.DictReader(buf, dialect=dialect)
@@ -230,15 +248,44 @@ def post_status_view():
     counts = {
         "live": 0, "gone": 0, "protected": 0,
         "suspended_or_deactivated": 0, "suspended": 0, "deactivated": 0,
-        "not_found": 0, "unknown": 0, "rate_limited": 0,
+        "not_found": 0, "unknown": 0, "rate_limited": 0, "skipped": 0,
         "error": 0, "invalid_url": 0, "other": 0,
     }
     rows: list[dict] = []
+    consecutive_rl = 0
+    aborted = False
     for i, it in enumerate(items):
+        if aborted:
+            # Stop calling the network; mark remaining inputs as skipped so the
+            # user can isolate and re-submit them.
+            skipped = StatusResult(
+                input=it["input"],
+                mode=mode,
+                platform="",
+                status=STATUS_SKIPPED,
+                status_label="Skipped (rate-limit abort)",
+                detail=(
+                    f"Skipped after {ABORT_AFTER_CONSECUTIVE_RATE_LIMITS} consecutive "
+                    "rate-limit results. Re-submit this subset later or with a "
+                    "longer pause."
+                ),
+            )
+            rows.append(_result_to_row(skipped, it.get("extra")))
+            counts["skipped"] += 1
+            continue
+
         res = _check_one(it, mode=mode, default_platform=default_platform)
         rows.append(_result_to_row(res, it.get("extra")))
         counts[res.status if res.status in counts else "other"] += 1
-        if i + 1 < len(items) and pause > 0:
+
+        if res.status == STATUS_RATE_LIMITED:
+            consecutive_rl += 1
+            if consecutive_rl >= ABORT_AFTER_CONSECUTIVE_RATE_LIMITS:
+                aborted = True
+        else:
+            consecutive_rl = 0
+
+        if not aborted and i + 1 < len(items) and pause > 0:
             time.sleep(pause)
 
     df = pd.DataFrame(rows)
@@ -279,9 +326,22 @@ def post_status_view():
         df.to_excel(writer, sheet_name=f"{mode}_status", index=False)
     xlsx_b64 = base64.b64encode(xlsx_buf.getvalue()).decode("ascii")
 
-    ctx["results"] = rows
+    ctx["results"] = rows[:MAX_TABLE_ROWS]
     ctx["total"] = len(rows)
+    ctx["preview_capped"] = len(rows) > MAX_TABLE_ROWS
+    ctx["preview_limit"] = MAX_TABLE_ROWS
     ctx["counts"] = counts
+    ctx["aborted"] = aborted
+    ctx["abort_threshold"] = ABORT_AFTER_CONSECUTIVE_RATE_LIMITS
+    ctx["aborted_skipped_count"] = counts["skipped"]
+    if mode == "account" and len(items) > SIZE_WARNING_THRESHOLD_ACCOUNT:
+        ctx["size_warning"] = (
+            f"You submitted {len(items):,} account checks. X heavily throttles "
+            "the syndication endpoint, so large batches typically degrade to "
+            "rate-limited / unknown after the first few hundred. Consider "
+            f"chunking into batches of ~{SIZE_WARNING_THRESHOLD_ACCOUNT} with "
+            "a higher pause-between value, or splitting across runs."
+        )
     ctx["download_csv_b64"] = csv_b64
     ctx["download_xlsx_b64"] = xlsx_b64
     ctx["download_filename_csv"] = f"post_status_{mode}.csv"

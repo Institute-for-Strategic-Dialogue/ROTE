@@ -63,7 +63,7 @@
     <textarea class="form-control" name="inputs" rows="6" placeholder="https://x.com/user/status/1234567890
 https://x.com/some_user
 some_user (treated as username for default platform)">{{ request.form.get("inputs", "") }}</textarea>
-    <div class="form-text">URLs preferred. Bare handles work for Accounts mode (treated as usernames for the default platform). Up to 5,000 rows.</div>
+    <div class="form-text">URLs preferred. Bare handles work for Accounts mode (treated as usernames for the default platform). Up to 10,000 rows; large account batches may auto-abort once X starts throttling.</div>
   </div>
 
   <div class="mb-3">
@@ -84,6 +84,17 @@ some_user (treated as username for default platform)">{{ request.form.get("input
   </div>
 </form>
 
+{% if size_warning %}
+  <div class="alert alert-warning">{{ size_warning }}</div>
+{% endif %}
+
+{% if aborted %}
+  <div class="alert alert-danger">
+    <strong>Batch aborted</strong> after {{ abort_threshold }} consecutive rate-limit results.
+    {% if aborted_skipped_count %}<strong>{{ aborted_skipped_count }}</strong> input{{ '' if aborted_skipped_count == 1 else 's' }} were skipped &mdash; they appear in the download with <code>status=skipped</code> so you can filter and re-submit them later (or with a longer pause).{% endif %}
+  </div>
+{% endif %}
+
 {% if results is defined and results %}
   <hr class="my-4">
   <div class="d-flex justify-content-between align-items-end flex-wrap gap-2 mb-2">
@@ -100,6 +111,7 @@ some_user (treated as username for default platform)">{{ request.form.get("input
         {% if counts.not_found %}<span class="badge bg-light text-dark border me-1">{{ counts.not_found }} not found</span>{% endif %}
         {% if counts.unknown %}<span class="badge bg-info text-dark me-1">{{ counts.unknown }} unknown</span>{% endif %}
         {% if counts.rate_limited %}<span class="badge bg-warning text-dark me-1">{{ counts.rate_limited }} rate-limited</span>{% endif %}
+        {% if counts.skipped %}<span class="badge bg-secondary me-1">{{ counts.skipped }} skipped</span>{% endif %}
         {% if counts.error %}<span class="badge bg-danger me-1">{{ counts.error }} error</span>{% endif %}
         {% if counts.invalid_url %}<span class="badge bg-danger me-1">{{ counts.invalid_url }} invalid</span>{% endif %}
       {% endif %}
@@ -120,6 +132,7 @@ some_user (treated as username for default platform)">{{ request.form.get("input
     {% endif %}
   </div>
   {% if download_csv_b64 %}<p class="small text-muted mb-2">Downloads include every column from your input CSV plus all status fields, so original metadata is preserved.</p>{% endif %}
+  {% if preview_capped %}<div class="alert alert-info small py-2">Showing the first <strong>{{ preview_limit }}</strong> rows below; download CSV / Excel for the full <strong>{{ total }}</strong>-row set.</div>{% endif %}
 
   <div class="table-responsive">
     <table class="table table-sm table-striped align-middle">
@@ -150,6 +163,7 @@ some_user (treated as username for default platform)">{{ request.form.get("input
           {% if r.status == "not_found" %}{% set badge = "light text-dark border" %}{% endif %}
           {% if r.status == "unknown" %}{% set badge = "info text-dark" %}{% endif %}
           {% if r.status == "rate_limited" %}{% set badge = "warning text-dark" %}{% endif %}
+          {% if r.status == "skipped" %}{% set badge = "secondary" %}{% endif %}
           {% if r.status in ("error", "invalid_url") %}{% set badge = "danger" %}{% endif %}
           <tr>
             <td style="max-width: 280px; word-break: break-all;">{{ r.input }}</td>
