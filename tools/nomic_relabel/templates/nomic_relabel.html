@@ -1,0 +1,279 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row mb-4">
+  <div class="col-lg-9">
+    <h1 class="h3 mb-2">Nomic Relabeller</h1>
+    <p class="text-muted">
+      Atlas generates topic labels at three depths. Export a sample of each topic,
+      write your own labels in Excel, then rebuild the dataset carrying them as
+      <code>Topic (Specific)</code> and <code>Topic (Broad)</code>.
+      Relabelling always creates a <strong>new private dataset</strong> — Atlas freezes a
+      dataset's schema after its first upload, so labels cannot be added in place.
+    </p>
+  </div>
+</div>
+
+<div class="card mb-4">
+  <div class="card-body">
+    <h2 class="h6 text-uppercase text-muted mb-3">Connection</h2>
+    <div class="row g-3">
+      <div class="col-md-5">
+        <label class="form-label">Nomic API key</label>
+        <input class="form-control" type="password" id="api_key" autocomplete="off"
+               placeholder="nk-…">
+        <div class="form-text">
+          Used for this request only and never stored on the server.
+        </div>
+      </div>
+      <div class="col-md-7">
+        <label class="form-label">Dataset</label>
+        <input class="form-control" type="text" id="identifier"
+               placeholder="org/dataset-slug or a pasted map URL">
+      </div>
+    </div>
+    <button class="btn btn-primary mt-3" id="btn-inspect" type="button">Inspect topics</button>
+  </div>
+</div>
+
+<!-- Step 1 -->
+<div class="card mb-4" id="card-step1" style="display:none">
+  <div class="card-body">
+    <h2 class="h5 mb-1">1 · Inspect &amp; export</h2>
+    <p class="text-muted small" id="dataset-info"></p>
+    <div class="table-responsive mb-3">
+      <table class="table table-sm align-middle" id="depth-table">
+        <thead><tr><th>Depth</th><th>Topics</th><th>Posts assigned</th><th>Example labels</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="row g-3 align-items-end">
+      <div class="col-sm-3">
+        <label class="form-label">Depth</label>
+        <select class="form-select" id="depth"></select>
+      </div>
+      <div class="col-sm-3">
+        <label class="form-label">Posts per topic</label>
+        <input class="form-control" type="number" id="n_per_topic" value="10" min="1" max="50">
+      </div>
+      <div class="col-sm-4">
+        <label class="form-label">Text column</label>
+        <select class="form-select" id="text_field"></select>
+      </div>
+      <div class="col-sm-2">
+        <button class="btn btn-primary w-100" id="btn-export" type="button">Export</button>
+      </div>
+    </div>
+    <div class="form-text mt-2" id="export-hint"></div>
+  </div>
+</div>
+
+<!-- Step 2 -->
+<div class="card mb-4" id="card-step2" style="display:none">
+  <div class="card-body">
+    <h2 class="h5 mb-1">2 · Remap &amp; upload</h2>
+    <p class="text-muted small">
+      Upload the workbook with <code>specific_label</code> filled in. Blank rows keep
+      Nomic's original label. <code>broad_label</code> is yours to invent and stays empty if unset.
+    </p>
+    <div class="row g-3">
+      <div class="col-md-6">
+        <label class="form-label">Edited workbook (.xlsx)</label>
+        <input class="form-control" type="file" id="workbook" accept=".xlsx">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Depth these came from</label>
+        <select class="form-select" id="depth_2"></select>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Text column to index</label>
+        <select class="form-select" id="text_field_2"></select>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Where should post text come from?</label>
+        <select class="form-select" id="source">
+          <option value="csv" selected>Upload the original CSV</option>
+          <option value="atlas">Pull it back from Atlas</option>
+        </select>
+        <div class="form-text">
+          Pulling from Atlas loads every row at once, so it is capped at
+          {{ "{:,}".format(max_atlas_pull) }} rows. The CSV path streams in chunks and
+          has no practical limit.
+        </div>
+      </div>
+      <div class="col-md-6" id="csv-wrap">
+        <label class="form-label">Original source CSV</label>
+        <input class="form-control" type="file" id="csv" accept=".csv">
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">New dataset name</label>
+        <input class="form-control" type="text" id="new_name" placeholder="my-dataset-relabelled">
+      </div>
+    </div>
+    <button class="btn btn-primary mt-3" id="btn-relabel" type="button">Build &amp; upload</button>
+  </div>
+</div>
+
+<!-- Progress / results -->
+<div id="progress-wrap" style="display:none" class="mb-3">
+  <div class="progress" role="progressbar" style="height:1.4rem">
+    <div class="progress-bar progress-bar-striped progress-bar-animated" id="progress-bar" style="width:0%">0%</div>
+  </div>
+  <div class="form-text" id="progress-msg"></div>
+</div>
+
+<div id="alert-wrap"></div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const wrap = $("progress-wrap"), bar = $("progress-bar"), msg = $("progress-msg");
+  let poll = null;
+
+  function alertBox(kind, html) {
+    $("alert-wrap").innerHTML = `<div class="alert alert-${kind}">${html}</div>`;
+  }
+  function clearAlert() { $("alert-wrap").innerHTML = ""; }
+
+  function showProgress(on) {
+    wrap.style.display = on ? "" : "none";
+    if (on) { bar.style.width = "0%"; bar.textContent = "0%"; msg.textContent = ""; }
+  }
+
+  function busy(on) {
+    ["btn-inspect", "btn-export", "btn-relabel"].forEach(id => { if ($(id)) $(id).disabled = on; });
+  }
+
+  function conn() {
+    const fd = new FormData();
+    fd.append("api_key", $("api_key").value);
+    fd.append("identifier", $("identifier").value);
+    return fd;
+  }
+
+  // Poll a job until it finishes. Cloudflare kills responses over ~100s, so all
+  // real work happens on a background thread and we watch it from here.
+  function watch(jobId, onDone) {
+    clearInterval(poll);
+    poll = setInterval(async () => {
+      let r;
+      try { r = await fetch(`job/${jobId}`).then(x => x.json()); }
+      catch (e) { return; }  // transient network blip; keep polling
+      if (r.error && !r.state) { clearInterval(poll); busy(false); showProgress(false); alertBox("danger", r.error); return; }
+      bar.style.width = r.pct + "%";
+      bar.textContent = r.pct + "%";
+      msg.textContent = r.msg || "";
+      if (r.state === "done") {
+        clearInterval(poll); busy(false); showProgress(false);
+        onDone(r);
+      } else if (r.state === "error") {
+        clearInterval(poll); busy(false); showProgress(false);
+        alertBox("danger", `<strong>Failed.</strong> ${r.error}`);
+      }
+    }, 1500);
+  }
+
+  async function post(url, fd) {
+    const r = await fetch(url, { method: "POST", body: fd }).then(x => x.json());
+    if (r.error) { alertBox("danger", r.error); busy(false); showProgress(false); return null; }
+    return r.job_id;
+  }
+
+  function fillSelect(sel, values, fmt) {
+    sel.innerHTML = "";
+    values.forEach(v => {
+      const o = document.createElement("option");
+      o.value = v.value !== undefined ? v.value : v;
+      o.textContent = fmt ? fmt(v) : v;
+      sel.appendChild(o);
+    });
+  }
+
+  let depths = [];
+
+  $("btn-inspect").addEventListener("click", async () => {
+    clearAlert(); busy(true); showProgress(true);
+    const jobId = await post("inspect", conn());
+    if (!jobId) return;
+    watch(jobId, (r) => {
+      const s = r.summary;
+      depths = s.depths;
+      $("dataset-info").innerHTML =
+        `<strong>${s.identifier}</strong> — ${s.rows.toLocaleString()} rows, id field <code>${s.id_field}</code>`;
+      const tb = $("depth-table").querySelector("tbody");
+      tb.innerHTML = "";
+      s.depths.forEach(d => {
+        tb.insertAdjacentHTML("beforeend",
+          `<tr><td>${d.depth}</td><td>${d.topics.toLocaleString()}</td>` +
+          `<td>${d.posts_assigned.toLocaleString()}</td><td class="small text-muted">${d.examples}</td></tr>`);
+      });
+      const opts = s.depths.map(d => ({ value: d.depth, label: `Depth ${d.depth} — ${d.topics} topics` }));
+      [$("depth"), $("depth_2")].forEach(sel => fillSelect(sel, opts, o => o.label));
+      [$("text_field"), $("text_field_2")].forEach(sel => fillSelect(sel, s.fields));
+      if (s.fields.includes("full_text")) {
+        [$("text_field"), $("text_field_2")].forEach(sel => sel.value = "full_text");
+      }
+      $("new_name").value = s.identifier.split("/").pop() + "-relabelled";
+      $("card-step1").style.display = "";
+      $("card-step2").style.display = "";
+      updateHint();
+    });
+  });
+
+  function updateHint() {
+    const d = depths.find(x => String(x.depth) === $("depth").value);
+    if (!d) return;
+    const n = parseInt($("n_per_topic").value || "10", 10);
+    $("export-hint").textContent =
+      `${d.topics} topics × ${n} = up to ${(d.topics * n).toLocaleString()} sampled posts.`;
+  }
+  $("depth").addEventListener("change", updateHint);
+  $("n_per_topic").addEventListener("input", updateHint);
+
+  $("source").addEventListener("change", () => {
+    $("csv-wrap").style.display = $("source").value === "csv" ? "" : "none";
+  });
+
+  $("btn-export").addEventListener("click", async () => {
+    clearAlert(); busy(true); showProgress(true);
+    const fd = conn();
+    fd.append("depth", $("depth").value);
+    fd.append("n_per_topic", $("n_per_topic").value);
+    fd.append("text_field", $("text_field").value);
+    const jobId = await post("export", fd);
+    if (!jobId) return;
+    watch(jobId, (r) => {
+      const s = r.summary;
+      alertBox("success",
+        `Workbook ready — <strong>${s.topics}</strong> topics, ` +
+        `<strong>${s.sampled_posts.toLocaleString()}</strong> sampled posts. ` +
+        `<a class="btn btn-sm btn-success ms-2" href="job/${jobId}/download">Download .xlsx</a>`);
+    });
+  });
+
+  $("btn-relabel").addEventListener("click", async () => {
+    clearAlert();
+    if (!$("workbook").files.length) { alertBox("warning", "Choose the edited workbook first."); return; }
+    if ($("source").value === "csv" && !$("csv").files.length) {
+      alertBox("warning", "Choose the original CSV, or switch to pulling from Atlas."); return;
+    }
+    busy(true); showProgress(true);
+    const fd = conn();
+    fd.append("depth_2", $("depth_2").value);
+    fd.append("new_name", $("new_name").value);
+    fd.append("text_field_2", $("text_field_2").value);
+    fd.append("source", $("source").value);
+    fd.append("workbook", $("workbook").files[0]);
+    if ($("source").value === "csv") fd.append("csv", $("csv").files[0]);
+    const jobId = await post("relabel", fd);
+    if (!jobId) return;
+    watch(jobId, (r) => {
+      const s = r.summary;
+      alertBox("success",
+        `Created <strong>${s.identifier}</strong> — ${s.rows.toLocaleString()} rows, private. ` +
+        `${s.blank_specific} topic(s) kept Nomic's label; ${s.blank_broad} have no broad label. ` +
+        `<a class="btn btn-sm btn-success ms-2" href="${s.map_link}" target="_blank" rel="noopener">Open map</a>`);
+    });
+  });
+})();
+</script>
+{% endblock %}
