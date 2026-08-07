@@ -200,7 +200,14 @@ def coerce_for_atlas(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     for col in df.columns:
         s = df[col]
-        if pd.api.types.is_bool_dtype(s):
+        # Must come first. Atlas stores many string columns as Arrow dictionary
+        # type, and to_pandas() turns those into Categoricals, so every row
+        # pulled back from Atlas hits this. fillna("") on a Categorical raises
+        # "Cannot setitem on a Categorical with a new category" unless "" is
+        # already one of the categories — go through object first.
+        if isinstance(s.dtype, pd.CategoricalDtype):
+            out[col] = s.astype(object).fillna("").astype(str)
+        elif pd.api.types.is_bool_dtype(s):
             out[col] = s.map({True: "true", False: "false"}).fillna("").astype(str)
         elif pd.api.types.is_datetime64_any_dtype(s):
             ser = pd.to_datetime(s, errors="coerce")
