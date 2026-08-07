@@ -23,3 +23,7 @@ scipy
 scikit-learn
 anthropic
 voyageai
+# Nomic Atlas client, used by nomic_relabel
+nomic
+pyarrow
+openpyxl
