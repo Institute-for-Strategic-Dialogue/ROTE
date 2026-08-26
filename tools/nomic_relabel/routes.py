@@ -132,7 +132,10 @@ def export():
         else:
             # No declared id field means no datum ids, so get_data() is not
             # available — the sampled rows have to come out of the map data.
-            wanted = [text_field, "full_text"] + xlsx_io.PREFERRED_CONTEXT
+            # Only the text column reaches the workbook now, so only it is
+            # worth materialising — this path pulls every row of whatever it
+            # asks for.
+            wanted = [text_field, "full_text"]
             rows = nomic_io.fetch_rows_from_map(
                 dataset, spec, sampled[id_field],
                 [c for c in wanted if c in dataset.dataset_fields],
