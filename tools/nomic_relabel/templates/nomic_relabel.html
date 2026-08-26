@@ -15,7 +15,7 @@
 
 <div class="card mb-4">
   <div class="card-body">
-    <h2 class="h6 text-uppercase text-muted mb-3">Connection</h2>
+    <h2 class="h6 text-uppercase text-muted mb-3">Verification</h2>
     <div class="row g-3">
       <div class="col-md-5">
         <label class="form-label">Nomic API key</label>
@@ -197,17 +197,17 @@
     watch(jobId, (r) => {
       const s = r.summary;
       depths = s.depths;
-      // Spell out where the id came from: a dataset uploaded without a
-      // unique_id_field still works, but the id is recovered rather than
-      // declared, and that is worth seeing before you label 200k rows.
+      // Say where the id came from. No advice to re-upload with one declared:
+      // unique_id_field can only be set when a dataset is created, and the
+      // Atlas UI upload gives you no chance to, so that is not something the
+      // reader can act on.
       $("dataset-info").innerHTML =
         `<strong>${s.identifier}</strong> — ${s.rows.toLocaleString()} rows, ` +
         `id field <code>${s.id_field}</code>` +
         (s.id_native ? "" :
           ` <span class="badge bg-warning text-dark">recovered</span>` +
-          `<div class="form-text">No <code>unique_id_field</code> is declared on this ` +
-          `dataset, so the relabeller is using ${s.id_note}. It will work, but ` +
-          `re-uploading with an id field declared is more robust.</div>`);
+          `<div class="form-text">This dataset declares no <code>unique_id_field</code>, ` +
+          `so the relabeller recovered one: ${s.id_note}.</div>`);
       const tb = $("depth-table").querySelector("tbody");
       tb.innerHTML = "";
       s.depths.forEach(d => {
