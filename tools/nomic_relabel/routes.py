@@ -42,13 +42,22 @@ def _cache_topics(identifier: str, payload) -> None:
 
 
 def _load_topics(dataset, progress=None):
-    """Topics for a dataset, reusing the single cache slot when possible."""
+    """Topics for a dataset, reusing the single cache slot when possible.
+
+    -> (topics_df, metadata, id_field, spec). `spec` says where the id came
+    from: the dataset's own unique_id_field when it declared one, otherwise a
+    column recovered by position (see nomic_io.IdSpec).
+    """
     cached = _topics_cache.get(dataset.identifier)
     if cached is not None:
         return cached
     if progress:
+        progress(0.1, "resolving the dataset's id field…")
+    spec = nomic_io.resolve_id_spec(dataset)
+    if progress:
         progress(0.15, "loading topics from Atlas…")
-    payload = nomic_io.load_topics(dataset)
+    topics_df, metadata, id_field = nomic_io.load_topics(dataset, spec)
+    payload = (topics_df, metadata, id_field, spec)
     _cache_topics(dataset.identifier, payload)
     return payload
 
@@ -81,13 +90,15 @@ def inspect():
     def work(progress):
         nomic_io.authenticate(api_key)
         dataset = nomic_io.open_dataset(identifier)
-        topics_df, metadata, id_field = _load_topics(dataset, progress)
+        topics_df, metadata, id_field, spec = _load_topics(dataset, progress)
         progress(0.8, "summarising depths…")
         summary = nomic_io.depth_summary(topics_df, metadata)
         return {
             "identifier": dataset.identifier,
             "rows": int(dataset.total_datums),
             "id_field": id_field,
+            "id_note": spec.note,
+            "id_native": bool(spec.native),
             "fields": [f for f in dataset.dataset_fields if f != id_field],
             "depths": summary.to_dict(orient="records"),
         }
@@ -111,13 +122,21 @@ def export():
     def work(progress):
         nomic_io.authenticate(api_key)
         dataset = nomic_io.open_dataset(identifier)
-        topics_df, metadata, id_field = _load_topics(dataset, progress)
+        topics_df, metadata, id_field, spec = _load_topics(dataset, progress)
 
         progress(0.3, "sampling posts…")
         sampled = nomic_io.sample_ids(topics_df, id_field, depth, n_per_topic)
-        rows = nomic_io.fetch_rows(
-            dataset, sampled[id_field],
-            progress=lambda f, m: progress(0.35 + 0.5 * f, m))
+        report = lambda f, m: progress(0.35 + 0.5 * f, m)
+        if spec.native:
+            rows = nomic_io.fetch_rows(dataset, sampled[id_field], progress=report)
+        else:
+            # No declared id field means no datum ids, so get_data() is not
+            # available — the sampled rows have to come out of the map data.
+            wanted = [text_field, "full_text"] + xlsx_io.PREFERRED_CONTEXT
+            rows = nomic_io.fetch_rows_from_map(
+                dataset, spec, sampled[id_field],
+                [c for c in wanted if c in dataset.dataset_fields],
+                progress=report)
         posts = sampled.merge(rows, on=id_field, how="left")
 
         progress(0.9, "building workbook…")
@@ -178,7 +197,7 @@ def relabel():
         try:
             nomic_io.authenticate(api_key)
             dataset = nomic_io.open_dataset(identifier)
-            topics_df, _metadata, id_field = _load_topics(dataset, progress)
+            topics_df, _metadata, id_field, spec = _load_topics(dataset, progress)
 
             depth_col = nomic_io.DEPTH_COLS[depth - 1]
             present = set(topics_df[depth_col].dropna().unique())
@@ -202,7 +221,7 @@ def relabel():
 
             if source == "csv":
                 chunks = nomic_io.iter_csv_labelled(
-                    csv_path, lookup, id_field, specific_map, broad_map)
+                    csv_path, lookup, spec, specific_map, broad_map)
             else:
                 if total > MAX_ATLAS_PULL_ROWS:
                     raise ValueError(
@@ -212,7 +231,7 @@ def relabel():
                         f"original CSV instead."
                     )
                 chunks = nomic_io.iter_atlas_labelled(
-                    dataset, lookup, id_field, specific_map, broad_map)
+                    dataset, lookup, spec, specific_map, broad_map)
 
             progress(0.1, f"uploading up to {total:,} rows…")
             new_ds, sent = nomic_io.upload_chunks(

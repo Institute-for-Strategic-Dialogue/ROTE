@@ -27,14 +27,16 @@ before assuming a much larger one will fit.
 from __future__ import annotations
 
 import gc
+import hashlib
 import re
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterator, NamedTuple, Optional
 
 import pandas as pd
 import pyarrow as pa
 
 import nomic.dataset
 from nomic.data_inference import convert_pyarrow_schema_for_atlas
+from nomic.data_operations import AtlasMapData
 from nomic.dataset import AtlasDataset
 
 DEPTH_COLS = ["topic_depth_1", "topic_depth_2", "topic_depth_3"]
@@ -54,6 +56,21 @@ BROAD_COL = "Topic (Broad)"
 # map's filter panel and can't be selected. Topics the analyst left without a
 # broad label get this instead, so they remain filterable.
 UNASSIGNED = "(unassigned)"
+
+# Columns worth trying as an id when Atlas has no unique_id_field of its own,
+# in preference order. `post_id` first because that is what AAO and Brandwatch
+# exports carry (md5 of the post url for most platforms, the native numeric id
+# on Facebook), so ids stay consistent with every other dataset in the org.
+ID_CANDIDATES = ["post_id", "id", "uuid", "doc_id", "guid"]
+# Failing that, hash a url column. md5 is 32 hex chars, inside Atlas's 36-char
+# ceiling on string id fields, and matches how post_id is already built.
+URL_CANDIDATES = ["url", "post_url", "link"]
+DERIVED_ID_COL = "url_id"
+
+# Resolving a fallback id means materialising one column for every row, since
+# the client has no chunked read. One narrow string column is cheap; this cap
+# is about the frames the map loader builds underneath it, not the column.
+MAX_ID_SCAN_ROWS = 400_000
 
 Progress = Optional[Callable[[float, str], None]]
 
@@ -96,15 +113,165 @@ def open_dataset(identifier: str) -> AtlasDataset:
 # ── Topics ────────────────────────────────────────────────────────────
 
 
-def load_topics(dataset: AtlasDataset):
+class IdSpec(NamedTuple):
+    """How to get a usable row id out of a dataset.
+
+    Atlas only reports an id field when the upload declared `unique_id_field`.
+    The web UI never does, and neither does `AtlasDataset(name)` without the
+    argument — so a dataset can carry a perfectly good `post_id` column and
+    still report None. When that happens the client keys its topics frame on a
+    synthetic `_position_index` which restarts at pos_0 in every tile (196k
+    rows of dau/canada-misogyn collapse to 18,613 distinct values), so it is
+    useless as a join key. The rows are still in tile order in both the topics
+    frame and the map data, though, so a real id column can be spliced back on
+    by position — see `_assert_aligned`.
+    """
+
+    field: str                     # column name the id lives in, everywhere
+    native: bool                   # True when Atlas's own unique_id_field
+    derived_from: Optional[str]    # column it is hashed from, when derived
+
+    @property
+    def note(self) -> str:
+        if self.native:
+            return f"`{self.field}` (declared on the dataset)"
+        if self.derived_from:
+            return f"`{self.field}` (md5 of `{self.derived_from}`)"
+        return f"`{self.field}` (recovered by position; no id field declared)"
+
+
+def _usable_id(s: pd.Series) -> bool:
+    s = s.astype(str)
+    blank = s.str.strip().isin(["", "None", "nan", "<NA>"]).any()
+    return not blank and s.is_unique
+
+
+def map_columns(dataset: AtlasDataset, fields: list) -> pd.DataFrame:
+    """Named columns from the map's data, in topics-frame row order."""
+    return AtlasMapData(dataset.maps[0], fields=list(fields)).df
+
+
+def _assert_aligned(topics_df: pd.DataFrame, data_df: pd.DataFrame, identifier: str) -> None:
+    """Refuse to splice unless the two frames are provably row-for-row.
+
+    Both loaders walk the same manifest in the same order, so they line up on a
+    healthy dataset — verified on dau/canada-misogyn: 196,035 rows each, all 21
+    tile boundaries identical, `_position_index` equal end to end. But both
+    `continue` past an unreadable tile, and only one of them would skip it, so
+    a corrupt sidecar could silently offset every label. Cheap to check, and
+    mislabelling the whole corpus is not a failure worth risking.
+    """
+    if len(topics_df) != len(data_df):
+        raise ValueError(
+            f"Could not line up topics with data for `{identifier}` "
+            f"({len(topics_df):,} topic rows vs {len(data_df):,} data rows). "
+            "A map tile may be missing — rebuild the index and retry."
+        )
+    a, b = topics_df.get("_position_index"), data_df.get("_position_index")
+    if a is None or b is None:
+        raise ValueError(
+            f"Could not line up topics with data for `{identifier}`: the "
+            "expected `_position_index` column is missing."
+        )
+    if not a.reset_index(drop=True).equals(b.reset_index(drop=True)):
+        raise ValueError(
+            f"Could not line up topics with data for `{identifier}`: tile "
+            "boundaries differ between the two. Rebuild the index and retry."
+        )
+
+
+def resolve_id_spec(dataset: AtlasDataset) -> IdSpec:
+    """Find something usable as a row id, declared or not."""
+    try:
+        native = dataset.id_field
+    except KeyError:
+        native = None
+    if native:
+        return IdSpec(native, True, None)
+
+    if not dataset.maps:
+        raise ValueError(
+            f"Dataset `{dataset.identifier}` has no maps yet — its index may "
+            "still be building. Wait for the map to finish, then retry."
+        )
+
+    total = int(dataset.total_datums)
+    if total > MAX_ID_SCAN_ROWS:
+        raise ValueError(
+            f"`{dataset.identifier}` has no declared unique id field and "
+            f"{total:,} rows — too many to recover one safely on this host. "
+            f"Re-upload it with unique_id_field set on a unique column."
+        )
+
+    fields = list(dataset.dataset_fields)
+    tried = []
+    for cand in ID_CANDIDATES:
+        if cand not in fields:
+            continue
+        if _usable_id(map_columns(dataset, [cand])[cand]):
+            return IdSpec(cand, False, None)
+        tried.append(cand)
+
+    for cand in URL_CANDIDATES:
+        if cand not in fields:
+            continue
+        if _usable_id(map_columns(dataset, [cand])[cand]):
+            return IdSpec(DERIVED_ID_COL, False, cand)
+        tried.append(cand)
+
+    detail = (f" Tried {', '.join(f'`{c}`' for c in tried)}, but none was "
+              "unique and free of blanks." if tried else
+              f" It has no id-like or url column: {', '.join(fields[:10])}…")
+    raise ValueError(
+        f"`{dataset.identifier}` has no declared unique id field and no column "
+        f"that can stand in for one.{detail} Re-upload it to Atlas with "
+        "unique_id_field set on a column of unique values no longer than 36 "
+        "characters."
+    )
+
+
+def apply_id(df: pd.DataFrame, spec: IdSpec) -> pd.DataFrame:
+    """Ensure `df` carries spec.field, hashing it into place when derived."""
+    if spec.derived_from:
+        if spec.derived_from not in df.columns:
+            raise ValueError(
+                f"Expected a `{spec.derived_from}` column to build the row id "
+                f"from. Columns found: {', '.join(list(df.columns)[:8])}…"
+            )
+        src = df[spec.derived_from].astype(str)
+        df[spec.field] = [hashlib.md5(v.encode("utf-8")).hexdigest() for v in src]
+    else:
+        if spec.field not in df.columns:
+            raise ValueError(
+                f"Expected a `{spec.field}` column to join on. Columns found: "
+                f"{', '.join(list(df.columns)[:8])}…"
+            )
+        df[spec.field] = df[spec.field].astype(str)
+    return df
+
+
+def load_topics(dataset: AtlasDataset, spec: Optional[IdSpec] = None):
     """-> (topics_df, metadata_df, id_field)."""
     if not dataset.maps:
         raise ValueError(
             f"Dataset `{dataset.identifier}` has no maps yet — its index may "
             "still be building. Wait for the map to finish, then retry."
         )
+    spec = spec or resolve_id_spec(dataset)
     topics = dataset.maps[0].topics
-    return topics.df, topics.metadata, dataset.id_field
+    topics_df, metadata = topics.df, topics.metadata
+
+    if not spec.native:
+        need = [spec.derived_from] if spec.derived_from else [spec.field]
+        side = map_columns(dataset, need)
+        _assert_aligned(topics_df, side, dataset.identifier)
+        side = apply_id(side, spec)
+        topics_df = topics_df.copy()
+        topics_df[spec.field] = side[spec.field].values
+        del side
+        gc.collect()
+
+    return topics_df, metadata, spec.field
 
 
 def depth_summary(topics_df: pd.DataFrame, metadata: pd.DataFrame) -> pd.DataFrame:
@@ -185,6 +352,33 @@ def fetch_rows(dataset: AtlasDataset, ids, progress: Progress = None) -> pd.Data
     return pd.DataFrame(out)
 
 
+def fetch_rows_from_map(dataset: AtlasDataset, spec: IdSpec, ids, fields,
+                        progress: Progress = None) -> pd.DataFrame:
+    """Fetch sampled rows for a dataset with no declared id field.
+
+    get_data() keys on Atlas datum ids, which a dataset without a
+    unique_id_field simply does not expose — so the sampled rows have to come
+    out of the map data instead. That materialises every row (no chunked read
+    exists), so only the columns actually needed are requested, and the frame is
+    cut down to the sample immediately.
+    """
+    cols = [c for c in dict.fromkeys(fields) if c]
+    keep = spec.derived_from or spec.field
+    if keep not in cols:
+        cols.append(keep)
+
+    _report(progress, 0.1, f"pulling {len(cols)} columns from the map…")
+    df = map_columns(dataset, cols)
+    df = apply_id(df, spec)
+
+    wanted = {str(i) for i in ids}
+    out = df[df[spec.field].isin(wanted)].copy()
+    del df
+    gc.collect()
+    _report(progress, 1.0, f"fetched {len(out):,}/{len(wanted):,} posts")
+    return out
+
+
 # ── Type coercion ─────────────────────────────────────────────────────
 
 INT32_MAX, INT32_MIN = 2_147_483_647, -2_147_483_648
@@ -234,7 +428,7 @@ def preflight(df: pd.DataFrame) -> pa.Schema:
 # ── Chunked sources ───────────────────────────────────────────────────
 
 
-def iter_csv_labelled(csv_path_or_buf, lookup: pd.Series, id_field: str,
+def iter_csv_labelled(csv_path_or_buf, lookup: pd.Series, spec: IdSpec,
                       specific_map: dict, broad_map: dict,
                       chunksize: int = CSV_CHUNK) -> Iterator[pd.DataFrame]:
     """Yield label-joined chunks, never holding more than one in memory.
@@ -245,13 +439,11 @@ def iter_csv_labelled(csv_path_or_buf, lookup: pd.Series, id_field: str,
     reader = pd.read_csv(csv_path_or_buf, dtype=str, keep_default_na=False,
                          chunksize=chunksize)
     for chunk in reader:
-        if id_field not in chunk.columns:
-            raise ValueError(
-                f"The CSV has no `{id_field}` column, so it cannot be joined to "
-                f"the dataset. Columns found: {', '.join(list(chunk.columns)[:8])}…"
-            )
-        chunk[id_field] = chunk[id_field].astype(str)
-        topic = chunk[id_field].map(lookup)
+        # Builds the derived id column when the dataset had none of its own, so
+        # the CSV only ever needs to carry the source column (a url), not an id
+        # it was never exported with.
+        chunk = apply_id(chunk, spec)
+        topic = chunk[spec.field].map(lookup)
         keep = topic.notna()
         chunk = chunk[keep]
         topic = topic[keep]
@@ -263,7 +455,7 @@ def iter_csv_labelled(csv_path_or_buf, lookup: pd.Series, id_field: str,
         yield chunk
 
 
-def iter_atlas_labelled(dataset: AtlasDataset, lookup: pd.Series, id_field: str,
+def iter_atlas_labelled(dataset: AtlasDataset, lookup: pd.Series, spec: IdSpec,
                         specific_map: dict, broad_map: dict,
                         chunksize: int = CSV_CHUNK) -> Iterator[pd.DataFrame]:
     """Same, sourced from Atlas instead of a CSV.
@@ -274,9 +466,8 @@ def iter_atlas_labelled(dataset: AtlasDataset, lookup: pd.Series, id_field: str,
     """
     full = dataset.maps[0].data.df
     for start in range(0, len(full), chunksize):
-        chunk = full.iloc[start:start + chunksize].copy()
-        chunk[id_field] = chunk[id_field].astype(str)
-        topic = chunk[id_field].map(lookup)
+        chunk = apply_id(full.iloc[start:start + chunksize].copy(), spec)
+        topic = chunk[spec.field].map(lookup)
         keep = topic.notna()
         chunk = chunk[keep]
         topic = topic[keep]
@@ -291,6 +482,42 @@ def iter_atlas_labelled(dataset: AtlasDataset, lookup: pd.Series, id_field: str,
 # ── Chunked upload ────────────────────────────────────────────────────
 
 
+def _check_ids(chunk: pd.DataFrame, id_field: str, seen: Optional[set]) -> None:
+    """Reject blank or repeated ids before they reach Atlas.
+
+    Atlas requires the id field to be non-null and unique. Catching it here
+    names the offending value; letting Atlas catch it fails mid-upload with a
+    dataset already half-created.
+    """
+    if id_field not in chunk.columns:
+        return
+    ids = chunk[id_field].astype(str)
+
+    blank = ids.str.strip().isin(["", "None", "nan", "<NA>"])
+    if blank.any():
+        raise ValueError(
+            f"{int(blank.sum()):,} row(s) have a blank `{id_field}`, which "
+            "Atlas rejects as an id. Fill or drop them and retry."
+        )
+
+    dupes = ids[ids.duplicated()]
+    if len(dupes):
+        raise ValueError(
+            f"`{id_field}` repeats within the source data — Atlas needs it "
+            f"unique. First repeat: `{dupes.iloc[0]}` "
+            f"({len(dupes):,} duplicate row(s) in this batch)."
+        )
+
+    if seen is not None:
+        overlap = seen.intersection(ids)
+        if overlap:
+            raise ValueError(
+                f"`{id_field}` repeats across the source data — Atlas needs it "
+                f"unique. First repeat: `{next(iter(overlap))}`."
+            )
+        seen.update(ids)
+
+
 def upload_chunks(chunks: Iterator[pd.DataFrame], name: str, id_field: str,
                   indexed_field: str, description: str = "",
                   is_public: bool = False, total_hint: int = 0,
@@ -303,8 +530,18 @@ def upload_chunks(chunks: Iterator[pd.DataFrame], name: str, id_field: str,
     """
     dataset = None
     sent = 0
+    seen: set = set()
+    tracking = True
 
     for chunk in chunks:
+        _check_ids(chunk, id_field, seen if tracking else None)
+        # Stop tracking rather than let the guard itself become the memory
+        # problem it is protecting against. Past this many rows the host is
+        # already outside its measured envelope (see module docstring).
+        if tracking and len(seen) > 500_000:
+            tracking = False
+            seen.clear()
+
         coerced = coerce_for_atlas(chunk)
         preflight(coerced)
         del chunk
