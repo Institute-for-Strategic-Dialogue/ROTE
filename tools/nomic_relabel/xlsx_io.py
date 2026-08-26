@@ -14,19 +14,17 @@ EDITABLE_COLS = ["specific_label", "broad_label"]
 ATLAS_SPECIFIC = "Topic (Specific)"
 ATLAS_BROAD = "Topic (Broad)"
 
-# Context columns worth showing next to the text when judging a topic label.
-# Only those actually present in the dataset are used.
-PREFERRED_CONTEXT = [
-    "date", "datetime", "platform", "author", "post_type", "sentiment",
-    "total_engagement", "views", "url", "domain",
-]
 
 
 def build_workbook(labels: pd.DataFrame, posts: pd.DataFrame,
                    id_field: str, text_field: str) -> bytes:
-    """-> xlsx bytes with two tabs: sampled_posts and labels."""
+    """-> xlsx bytes with two tabs, in order: labels and sampled_posts."""
+    # Three columns only: the topic, the id to trace a row back by, and the
+    # text being judged. Context columns were more distraction than help when
+    # the job is "does this label fit this post?". `id_field` and `text_field`
+    # are whatever the dataset supplies — `post_id`/`full_text` on an AAO or
+    # Brandwatch export, but `url_id` on a dataset whose id had to be derived.
     cols = ["topic", id_field, text_field]
-    cols += [c for c in PREFERRED_CONTEXT if c in posts.columns and c not in cols]
     posts_out = posts[[c for c in cols if c in posts.columns]].copy()
 
     # Order topics exactly as they appear in the labels sheet (largest first) so
@@ -41,8 +39,10 @@ def build_workbook(labels: pd.DataFrame, posts: pd.DataFrame,
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm") as writer:
-        posts_out.to_excel(writer, sheet_name=POSTS_SHEET, index=False)
+        # labels first: it is the tab the analyst works in, and the one that
+        # gets read back in step 2. sampled_posts is reference material.
         labels.to_excel(writer, sheet_name=LABELS_SHEET, index=False)
+        posts_out.to_excel(writer, sheet_name=POSTS_SHEET, index=False)
 
         wb = writer.book
         wrap = wb.add_format({"text_wrap": True, "valign": "top"})
